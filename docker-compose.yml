@@ -1,0 +1,57 @@
+services:
+  lan-walkie:
+    build: .
+    image: lan-walkie:latest
+    container_name: lan-walkie
+    restart: unless-stopped
+    ports:
+      # BIND_ADDR defaults to every interface. Set it to the LAN IP, or to
+      # 127.0.0.1 if everything goes through Tailscale Serve on this host.
+      - "${BIND_ADDR:-0.0.0.0}:8443:8443"
+    volumes:
+      - lan-walkie-certs:/app/certs
+    environment:
+      # Each value can be set in Portainer's "Environment variables" section
+      # (or an .env file next to this compose file); the defaults apply when
+      # unset. Keeping them there keeps secrets out of git.
+      - PORT=8443
+      # The container can't see the host's real LAN IP/hostname, so name them
+      # for the self-signed certificate. Generated once: delete the
+      # lan-walkie-certs volume after changing these.
+      - CERT_HOSTNAMES=${CERT_HOSTNAMES:-}
+      - CERT_IPS=${CERT_IPS:-}
+      - MAX_TRANSMIT_MS=${MAX_TRANSMIT_MS:-60000}
+      - MAX_CLIENTS=${MAX_CLIENTS:-32}
+      # Roger beep for every client (browsers, CLI, radio gateway): on/off.
+      - ROGER_BEEP=${ROGER_BEEP:-off}
+      # Logging (see docs/LOGGING.md): LOG_LEVEL debug|info|warn|error,
+      # LOG_FORMAT text|json, LOG_STATS_MS = summary line interval (0 = off).
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_FORMAT=${LOG_FORMAT:-text}
+      - LOG_STATS_MS=${LOG_STATS_MS:-300000}
+      # Generate with: openssl rand -hex 24  (16+ chars; unset = priority off)
+      - PRIORITY_TOKEN=${PRIORITY_TOKEN:-}
+      # Comma-separated browser origins allowed to open the WebSocket.
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+      # Space- or comma-separated origins allowed to embed the page in an iframe
+      # (e.g. a Home Assistant dashboard). Empty = framing denied.
+      - FRAME_ANCESTORS=${FRAME_ANCESTORS:-}
+    # Docker keeps container logs forever by default; cap them (5 files of 10 MB)
+    # so a chatty day can never fill the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    mem_limit: 256m
+
+volumes:
+  lan-walkie-certs:

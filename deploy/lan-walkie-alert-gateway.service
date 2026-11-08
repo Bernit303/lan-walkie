@@ -1,0 +1,22 @@
+# Phone alerts about the radio gateway (run on the gateway machine, e.g. gateway-host).
+# Replace @USER@ (your login) and @REPO@ (the checkout path). Setup: docs/ALERTS.md
+[Unit]
+Description=LAN Walkie phone alerts (gateway log)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=@USER@
+# Lets the user read the journal.
+SupplementaryGroups=systemd-journal
+EnvironmentFile=/etc/lan-walkie-alert.env
+ExecStart=/bin/sh -c 'journalctl -u lan-walkie-gateway -f -n0 -o short-iso | python3 -u @REPO@/tools/alert_watch.py --mode gateway'
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

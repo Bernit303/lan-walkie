@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roger beep audition</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#10151a;color:#e8edf2;max-width:560px;margin:32px auto;padding:0 16px}
+  h1{font-size:22px} p{color:#8b98a5}
+  button{display:block;width:100%;text-align:left;margin:10px 0;padding:16px;font-size:17px;border-radius:10px;border:1px solid #2a333c;background:#1a2129;color:#e8edf2;cursor:pointer}
+  button:active{background:#3b82f6} small{display:block;color:#8b98a5;margin-top:4px}
+</style></head><body>
+<h1>Roger beep audition</h1>
+<p>Click each one and note the number you like. Turn your volume to what you normally use for the walkie. These play at the same level the app uses.</p>
+<div id="list"></div>
+<script>
+// shape: notes [{freq, ms}], wave, level (the app uses square at 0.35), gap between notes in ms
+const OPTIONS = [
+  { name: '1. Two-note rise (current)', note: 'bip-BEEP, 1000 then 1500 Hz', wave: 'square', level: 0.35, gap: 20, notes: [{freq:1000,ms:80},{freq:1500,ms:130}] },
+  { name: '2. Single long beep', note: 'one 1500 Hz tone, 250 ms', wave: 'square', level: 0.35, gap: 0, notes: [{freq:1500,ms:250}] },
+  { name: '3. Two-note fall', note: 'BEEP-bop, 1600 then 1100 Hz', wave: 'square', level: 0.35, gap: 20, notes: [{freq:1600,ms:80},{freq:1100,ms:140}] },
+  { name: '4. Triple chirp', note: 'three quick rising notes', wave: 'square', level: 0.35, gap: 15, notes: [{freq:1200,ms:60},{freq:1500,ms:60},{freq:1800,ms:90}] },
+  { name: '5. Double beep', note: 'two identical high beeps, 2000 Hz', wave: 'square', level: 0.3, gap: 60, notes: [{freq:2000,ms:80},{freq:2000,ms:80}] },
+  { name: '6. Loud pure tone', note: 'smooth sine, 1000 Hz, 220 ms', wave: 'sine', level: 0.8, gap: 0, notes: [{freq:1000,ms:220}] },
+  { name: '7. MOTOTRBO warble (per Gemini)', note: 'G6-C6-G6-E6, 40 ms each, 160 ms total, radio-speaker character', radio: true, level: 0.7, notes: [{freq:1568,ms:40},{freq:1046.5,ms:40},{freq:1568,ms:40},{freq:1318.5,ms:40}] },
+  { name: '8. MOTOTRBO warble, long first note', note: 'same, but the first note is 80 ms (200 ms total)', radio: true, level: 0.7, notes: [{freq:1568,ms:80},{freq:1046.5,ms:40},{freq:1568,ms:40},{freq:1318.5,ms:40}] },
+  { name: '9. P25 / trunked triple chirp (per Gemini)', note: '910 Hz, beep-beep-BEEP, 150 ms, radio-speaker character', radio: true, level: 0.7, notes: [{freq:910,ms:30},{freq:0,ms:20},{freq:910,ms:30},{freq:0,ms:20},{freq:910,ms:50}] },
+];
+let ctx;
+// Radio-speaker style: ONE oscillator so the phase stays continuous when the pitch
+// changes (no clicks), fundamental plus 7% third harmonic, 2 ms fades around each
+// burst, then a 300-3400 Hz band like a handheld's speaker path.
+function playRadio(o) {
+  const real = new Float32Array([0, 0, 0, 0]);
+  const imag = new Float32Array([0, 0.93, 0, 0.07]);
+  const osc = ctx.createOscillator();
+  osc.setPeriodicWave(ctx.createPeriodicWave(real, imag));
+  const env = ctx.createGain(); env.gain.value = 0;
+  const out = ctx.createGain(); out.gain.value = o.level;
+  const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 300;
+  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3400;
+  osc.connect(env).connect(hp).connect(lp).connect(out).connect(ctx.destination);
+  const ramp = 0.002;
+  let t = ctx.currentTime + 0.01, on = false;
+  osc.frequency.setValueAtTime(o.notes.find((n) => n.freq).freq, t);
+  osc.start(t);
+  for (const n of o.notes) {
+    const d = n.ms / 1000;
+    if (n.freq) {
+      osc.frequency.setValueAtTime(n.freq, t);
+      if (!on) { env.gain.setValueAtTime(0, t); env.gain.linearRampToValueAtTime(1, t + ramp); on = true; }
+    } else if (on) {
+      env.gain.setValueAtTime(1, t - ramp); env.gain.linearRampToValueAtTime(0, t); on = false;
+    }
+    t += d;
+  }
+  if (on) { env.gain.setValueAtTime(1, t - ramp); env.gain.linearRampToValueAtTime(0, t); }
+  osc.stop(t + 0.02);
+}
+
+function play(o) {
+  ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+  ctx.resume();
+  if (o.radio) return playRadio(o);
+  const out = ctx.createGain(); out.gain.value = o.level;
+  const soften = ctx.createBiquadFilter(); soften.type = 'lowpass'; soften.frequency.value = 4000;
+  out.connect(soften).connect(ctx.destination);
+  let t = ctx.currentTime + 0.01;
+  for (const n of o.notes) {
+    const d = n.ms / 1000, osc = ctx.createOscillator(), env = ctx.createGain();
+    osc.type = o.wave; osc.frequency.value = n.freq;
+    env.gain.setValueAtTime(0, t); env.gain.linearRampToValueAtTime(1, t + 0.005);
+    env.gain.setValueAtTime(1, t + d - 0.01); env.gain.linearRampToValueAtTime(0, t + d);
+    osc.connect(env).connect(out); osc.start(t); osc.stop(t + d + 0.01);
+    t += d + o.gap / 1000;
+  }
+}
+for (const o of OPTIONS) {
+  const b = document.createElement('button');
+  b.innerHTML = o.name + '<small>' + o.note + '</small>';
+  b.onclick = () => play(o);
+  list.appendChild(b);
+}
+</script></body></html>

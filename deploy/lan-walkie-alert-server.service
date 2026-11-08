@@ -1,0 +1,19 @@
+# Phone alert when the radio gateway is offline (run where the signaling server's container runs,
+# e.g. server-host). Replace @USER@ (a login in the "docker" group) and @REPO@. Setup: docs/ALERTS.md
+[Unit]
+Description=LAN Walkie phone alerts (server log)
+After=network-online.target docker.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=@USER@
+EnvironmentFile=/etc/lan-walkie-alert.env
+ExecStart=/bin/sh -c 'docker logs -f --since 0s lan-walkie 2>&1 | python3 -u @REPO@/tools/alert_watch.py --mode server'
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

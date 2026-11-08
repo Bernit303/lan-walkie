@@ -1,0 +1,1814 @@
+#!/usr/bin/env python3
+"""
+LAN Walkie CLI — headless client for machines with no browser/GUI, and the
+radio gateway for an AIOC (All-In-One-Cable, https://github.com/skuep/AIOC).
+
+Speaks the exact same signaling protocol as the browser client, and joins
+the mesh with real WebRTC (ICE, DTLS, SRTP) via GStreamer's webrtcbin, so
+it interoperates directly with browser participants.
+
+Two ways to run it:
+
+  Interactive (a person at a terminal): press SPACE once to start talking,
+  again to stop. Terminals can't see key release, so PTT is a toggle.
+
+  Radio gateway (--aioc / --ptt-serial): the AIOC is the machine's sound
+  card and PTT line. Someone on the LAN talks -> the radio is keyed and
+  their audio plays into it. The radio receives something -> VOX on the
+  AIOC's audio input requests the floor and the audio goes to the LAN.
+
+Install (Ubuntu/Debian):
+  sudo apt install python3-gi gir1.2-gst-plugins-bad-1.0 \\
+      gstreamer1.0-plugins-base gstreamer1.0-plugins-good \\
+      gstreamer1.0-plugins-bad gstreamer1.0-nice gstreamer1.0-tools \\
+      python3-websockets python3-serial
+
+Run:
+  python3 lan_walkie_cli.py wss://<server>:8443 --name "Radio" --aioc \\
+      --alsa-device "plughw:CARD=AIOC,DEV=0"
+"""
+
+import argparse
+import asyncio
+import faulthandler
+import hashlib
+import json
+import math
+import os
+import re
+import ssl
+import sys
+import termios
+import threading
+import time
+import tty
+
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GstWebRTC", "1.0")
+gi.require_version("GstSdp", "1.0")
+from gi.repository import Gst, GstSdp, GstWebRTC, GLib  # noqa: E402
+
+Gst.init(None)
+
+AIOC_USB_VID = 0x1209  # per the AIOC firmware-update docs (dfu-util -d 1209:7388)
+AIOC_USB_PID = 0x7388
+MAX_SIGNALING_BYTES = 256 * 1024  # SDP is a few KB; far above that is not signaling
+LEVEL_INTERVAL_NS = 20_000_000  # 20 ms level reports for VOX
+# Roger beep: a MOTOTRBO-style talk-permit warble, four back-to-back notes
+# (G6 C6 G6 E6, 200 ms). Same notes as BEEP_PATTERN in public/app.js; change
+# both together. Played as a triangle wave, which carries a little third
+# harmonic like the browser's tone does.
+BEEP_PATTERN = [(1568.0, 80), (1046.5, 40), (1568.0, 40), (1318.5, 40)]  # (Hz, ms)
+BEEP_MS = sum(ms for _, ms in BEEP_PATTERN)
+
+# Software squelch. The only "squelch" this program has is the VOX gate that decides
+# when audio from the radio is sent to the LAN; the radio's own squelch is a setting
+# on the radio itself.
+#   on : the gate as it has always been (-40 dBFS, 60 ms attack, 1.5 s hang).
+#   off: almost no software gate, so the radio's own squelch does the filtering.
+#        Not "no threshold at all": on the reference setup the radio's idle floor sits
+#        near -64 dBFS even with its squelch closed (docs/AIOC.md), and a gate below
+#        that would see audio forever and keep the channel occupied. -55 leaves 9 dB
+#        above that floor and is still far below speech (about -17 dBFS). The 300 ms
+#        pre-roll keeps the start of a transmission that arrives while the floor
+#        request is still on its way to the server.
+SQUELCH_PRESETS = {
+    "on": {"threshold_db": -40.0, "attack_ms": 60, "hang_ms": 1500, "preroll_ms": 0},
+    "off": {"threshold_db": -55.0, "attack_ms": 20, "hang_ms": 1500, "preroll_ms": 300},
+}
+STUCK_OPEN_SECONDS = 30  # squelch off: warn if the radio input never goes quiet this long
+# Input watchdog: the level meter normally reports every 20 ms, even on a silent
+# channel. If it reports nothing for this long, the capture thread is stuck (seen on
+# 2026-11-05 and 2026-11-06: the gateway stayed connected but deaf for hours while
+# transmitting still worked). The process exits and systemd (Restart=always) starts it clean.
+LEVEL_STALL_SECONDS = 15
+# The asyncio thread runs the floor logic and the PTT unkey timers. If it does not tick for this
+# long (a native peer teardown blocking it, a hung signaling call), unkey from the GLib thread and restart.
+CONTROL_STALL_SECONDS = 6
+# The radio input and the level meter run on the capture thread. Everything after the
+# encoder (the tee and every peer's branch, which are added and removed while it runs)
+# is moved onto its own thread behind a queue that drops the oldest audio instead of
+# blocking, so nothing that happens to a peer can stop the level meter (and with it
+# radio -> LAN) again.
+CAPTURE_DECOUPLE_NS = 500_000_000
+
+
+def squelch_settings(mode, threshold_db=None, attack_ms=None, hang_ms=None, preroll_ms=None):
+    """The gate settings for a squelch mode; any value given explicitly wins over the preset."""
+    key = str(mode).strip().lower()
+    if key not in SQUELCH_PRESETS:
+        raise ValueError(f"squelch must be 'on' or 'off', not {mode!r}")
+    settings = dict(SQUELCH_PRESETS[key])
+    for name, value in (("threshold_db", threshold_db), ("attack_ms", attack_ms),
+                        ("hang_ms", hang_ms), ("preroll_ms", preroll_ms)):
+        if value is not None:
+            settings[name] = value
+    return settings
+BEEP_VOLUME = 0.5  # audiotestsrc amplitude; on a gateway this goes out over the radio, tune on hardware
+
+
+def safe_text(value, limit=64):
+    """
+    Peer-supplied strings (names, ids) go to a terminal and to logs. Make
+    them printable: drop control/format characters and anything that cannot
+    be encoded (lone surrogates), then cap the length.
+    """
+    text = str(value).encode("utf-8", "replace").decode("utf-8", "replace")
+    text = "".join(ch for ch in text if ch.isprintable())
+    return text[:limit] or "?"
+
+
+def normalize_ws_url(url):
+    """Lower-case the scheme. URL schemes are case-insensitive (the websockets
+    library treats WS:// as plaintext), but the TLS and token checks below
+    compare the text, so 'WS://host' would otherwise slip past them."""
+    url = str(url).strip()
+    scheme, sep, rest = url.partition("://")
+    return scheme.lower() + sep + rest if sep else url
+
+
+def sha256_pin(der_bytes):
+    return hashlib.sha256(der_bytes).hexdigest()
+
+
+def normalize_pin(pin):
+    return re.sub(r"[^0-9a-f]", "", pin.lower())
+
+
+def offered_opus_payload(sdp_text):
+    """Select Opus from the first active audio m-line, not from another track."""
+    in_audio = False
+    formats = set()
+    for raw in sdp_text.splitlines():
+        line = raw.strip()
+        if line.startswith("m="):
+            if in_audio:
+                break
+            fields = line[2:].split()
+            in_audio = len(fields) >= 4 and fields[0] == "audio" and fields[1] != "0"
+            if in_audio:
+                formats = set(fields[3:])
+        elif in_audio:
+            match = re.fullmatch(r"a=rtpmap:(\d+)\s+opus/48000/2", line, re.IGNORECASE)
+            if match and match[1] in formats and 96 <= int(match[1]) <= 127:
+                return int(match[1])
+    raise ValueError("remote offer has no supported Opus audio payload")
+
+
+class UpnpConfigError(RuntimeError):
+    """libnice's UPnP could not be switched off (or confirmed off)."""
+
+
+def _add_gobject_ref(obj):
+    """g_object_ref() on the C object behind a PyGObject wrapper.
+
+    hash() of a PyGObject wrapper is the address of the object it wraps.
+    """
+    import ctypes
+
+    lib = ctypes.CDLL("libgobject-2.0.so.0")
+    lib.g_object_ref.argtypes = [ctypes.c_void_p]
+    lib.g_object_ref.restype = ctypes.c_void_p
+    lib.g_object_ref(ctypes.c_void_p(hash(obj)))
+
+
+def configure_upnp(webrtcbin, enabled=False):
+    """Configure libnice before candidate gathering starts.
+
+    UPnP is unnecessary on LAN/Tailscale and the Ubuntu 24.04 IGD stack can
+    grow without bound while retrying router port mappings (about 230 MB/min).
+    The setting is read back; if UPnP was asked to be OFF and cannot be
+    confirmed off, this raises instead of continuing, because continuing would
+    silently bring the memory growth back. Passing --upnp (enabled=True) means
+    the operator accepted libnice's default behaviour, so nothing is enforced.
+
+    Object ownership (measured on GStreamer 1.24.2, tools/ice_lifetime_probe.py):
+    webrtcbin creates its ICE object without sinking the floating reference, so
+    when PyGObject wraps it the wrapper takes over that single reference
+    (refcount 1). Letting the wrapper go then frees an object webrtcbin still
+    uses, which showed up as GLib "G_IS_OBJECT" criticals (and crashes when the
+    wrapper was kept forever). We give the wrapper its own reference, but only
+    when the refcount really is 1, so a GStreamer that fixes this is left alone.
+    """
+    try:
+        ice = webrtcbin.get_property("ice-agent")
+        if getattr(ice, "__grefcount__", None) == 1:
+            _add_gobject_ref(ice)
+        agent = ice.get_property("agent")
+        agent.set_property("upnp", enabled)
+        actual = agent.get_property("upnp")
+    except Exception as e:
+        if enabled:
+            return
+        raise UpnpConfigError(
+            f"could not turn libnice UPnP off ({e}). Refusing to connect: with UPnP on, "
+            "the process can grow without bound. Pass --upnp to accept that risk."
+        ) from e
+    if not enabled and bool(actual):
+        raise UpnpConfigError(
+            "libnice UPnP is still on after trying to turn it off. Refusing to connect. "
+            "Pass --upnp to accept that risk."
+        )
+
+
+class Vox:
+    """
+    Voice-activated detection on the radio's audio input. Pure logic, fed
+    one level reading at a time, so it can be tested without GStreamer.
+
+    update() returns "start" when audio has been above the threshold for
+    attack_ms, "stop" when it has been below it for hang_ms, else None.
+    Readings are ignored (and the detector re-armed) while `blocked` is
+    true — i.e. while our own transmitter is keyed and its audio can leak
+    back into the input.
+    """
+
+    def __init__(self, threshold_db=-40.0, attack_ms=60, hang_ms=1500):
+        self.threshold_db = threshold_db
+        self.attack_ms = attack_ms
+        self.hang_ms = hang_ms
+        self.active = False
+        self._above_ms = 0.0
+        self._below_ms = 0.0
+
+    def reset(self):
+        self.active = False
+        self._above_ms = 0.0
+        self._below_ms = 0.0
+
+    def update(self, level_db, dt_ms, blocked=False):
+        if blocked:
+            was_active = self.active
+            self.reset()
+            return "stop" if was_active else None
+
+        if level_db > self.threshold_db:
+            self._above_ms += dt_ms
+            self._below_ms = 0.0
+        else:
+            self._below_ms += dt_ms
+            self._above_ms = 0.0
+
+        if not self.active and self._above_ms >= self.attack_ms:
+            self.active = True
+            return "start"
+        if self.active and self._below_ms >= self.hang_ms:
+            self.active = False
+            return "stop"
+        return None
+
+
+class AiocPtt:
+    """
+    Keys the radio through the AIOC's virtual serial port.
+
+    Per the AIOC docs (firmware >= 1.2.0), PTT is asserted when DTR=1 and
+    RTS=0. Any other combination is receive. Firmware older than 1.2.0 keyed
+    on DTR alone and would key the radio the moment the port is opened —
+    update the firmware before using this.
+    """
+
+    def __init__(self, port):
+        import serial
+
+        self.port = port
+        self.keyed = False
+        self._ser = serial.Serial()
+        self._ser.port = port
+        # Idle state set before open() so it is applied as the port opens.
+        self._ser.dtr = False
+        self._ser.rts = True
+        self._ser.open()
+        self._apply(False)
+
+    def _apply(self, on):
+        self._ser.dtr = bool(on)
+        self._ser.rts = not on
+        self.keyed = bool(on)
+
+    def key(self):
+        if not self.keyed:
+            self._apply(True)
+
+    def unkey(self):
+        # Always write the idle state, even if we believe we are not keyed.
+        self._apply(False)
+
+    def close(self):
+        """Unkey and release the port. Safe to call more than once."""
+        if not self._ser.is_open:
+            return
+        try:
+            self.unkey()
+        except Exception:
+            pass
+        try:
+            self._ser.close()
+        except Exception:
+            pass
+        self.keyed = False
+
+
+def find_aioc_port():
+    from serial.tools import list_ports
+
+    for p in list_ports.comports():
+        if p.vid == AIOC_USB_VID and p.pid == AIOC_USB_PID:
+            return p.device
+    return None
+
+
+class Peer:
+    def __init__(self, peer_id, name, priority=False):
+        self.id = peer_id
+        self.name = name
+        self.priority = priority
+        self.webrtcbin = None
+        self.webrtc_sink_pad = None
+        self.signal_handlers = []
+        self.opus_payload = 96
+        self.send_payloader = None
+        self.send_caps = None
+        self.send_ready = False
+        self.offer_started = False
+        self.offer_applied = False  # a remote offer has already been applied to this webrtcbin
+        self.pending_ice = []
+        self.tee_pad = None
+        self.send_queue = None  # decouples this peer's sink from the shared capture thread
+        self.mixer_pad = None
+        self.recv_elements = []  # queue, depay, dec, conv, resample — for cleanup
+
+
+class WalkieClient:
+    def __init__(
+        self,
+        url,
+        name,
+        source,
+        sink,
+        stun,
+        tls_mode,
+        ca_file=None,
+        pin=None,
+        token=None,
+        ptt=None,
+        vox=None,
+        ptt_tail_ms=300,
+        max_ptt_seconds=90,
+        vox_debug=False,
+        upnp=False,
+        beep_lead_ms=400,
+        preroll_ms=0,
+        squelch="on",
+        rx_gain_db=0.0,
+    ):
+        self.url = normalize_ws_url(url)
+        self.rx_gain_db = rx_gain_db  # boost for audio arriving from the LAN, applied per peer before the mixer
+        # Loudness of each peer's audio as received, gathered while they hold the
+        # floor and summarised when they let go: peer id -> {"n", "pow", "peak"}.
+        self.rx_stats = {}
+        self.name = name
+        self.source = source
+        self.sink = sink
+        self.stun = stun
+        self.upnp = upnp
+        self.tls_mode = tls_mode  # "system" | "ca-file" | "pin" | "insecure"
+        self.ca_file = ca_file
+        self.pin = pin
+        self.token = token
+        self.verified = False  # set per connection once the server is authenticated
+
+        self.ptt = ptt  # AiocPtt or None
+        self.vox = vox  # Vox or None
+        self.preroll_ms = preroll_ms  # radio audio is delayed this long so a late floor grant does not clip it
+        self.squelch = squelch  # "on" | "off", for the log only; the settings are in `vox` and `preroll_ms`
+        self._open_since = None
+        self._open_warned = False
+        self.ptt_tail_ms = ptt_tail_ms
+        # The beep goes through the same audio buffers as voice, so it reaches the air
+        # later than the moment it is started; keep the radio keyed this much longer.
+        self.beep_lead_ms = beep_lead_ms
+        self.max_ptt_seconds = max_ptt_seconds
+        self._unkey_handle = None
+        self._ptt_watchdog = None
+        self._beep_timers = []  # scheduled roger-beep notes, cancelled by _end_beep
+        self._control_seen = None  # last tick of the asyncio thread; None = not watching
+        self._vox_blocked_until = 0.0
+        self.vox_debug = vox_debug
+        self._level_msgs = 0
+        self._tee_buffers = 0  # audio buffers that reached the tee (counted by a pad probe)
+        self._wd_last_levels = 0
+        self._wd_last_sent = 0
+        self._wd_sent_seen = False  # the send path has been seen working at least once
+        self._wd_quiet_ticks = 0
+        self._last_peer_op = None  # (what, peer id, time) of the latest peer add/remove, for the watchdog report
+        self._dbg_status_last = 0
+        self._dbg_peak = float("-inf")
+        self._dbg_window_peak = float("-inf")
+        self._dbg_last = time.monotonic()
+
+        self.ws = None
+        self.loop = None
+        self.my_id = None
+        self.peers = {}  # id -> Peer
+        self.talking = False  # we asked for the floor and have not released it
+        self.have_floor = False  # the server has granted it to us
+        self.floor_holder = None
+        self.roger_beep = False  # the server's global switch, refreshed on every `welcome`
+
+        self.pipeline = None
+        self.tee = None
+        self._drain_pad = None  # permanent healthy branch on the tee, see _add_drain_branch
+        self.mixer = None
+        self.mic_mute = None
+        self.beep_gate = None  # None = no beep available (never built, or building it failed)
+        self.beep_src = None
+
+    # ---------- GStreamer setup ----------
+
+    def _capture_chain(self, with_preroll):
+        level = ""
+        preroll = ""
+        if self.vox:
+            # Before the mute: the radio's audio is measured even while it is
+            # not being sent to the LAN, which is exactly when VOX needs it.
+            level = (
+                f"level name=lvl interval={LEVEL_INTERVAL_NS} post-messages=true ! "
+                f"queue name=capq leaky=downstream max-size-buffers=0 max-size-bytes=0 "
+                f"max-size-time={CAPTURE_DECOUPLE_NS} ! "
+            )
+            if with_preroll and self.preroll_ms > 0:
+                # After the level meter, so VOX still sees the audio live while the audio
+                # that is sent is this much behind. Only the radio -> LAN path pays the delay.
+                ns = int(self.preroll_ms * 1_000_000)
+                preroll = (
+                    f"queue name=preroll max-size-buffers=0 max-size-bytes=0 "
+                    f"max-size-time={ns * 3} min-threshold-time={ns} ! "
+                )
+        return (
+            f"{self.source} ! audioconvert ! audioresample ! {level}{preroll}"
+            f"volume name=mic-mute mute=true ! "
+            f"opusenc bitrate=32000 ! tee name=t"
+        )
+
+    def _add_drain_branch(self):
+        """Keep one healthy, permanent branch on the tee.
+
+        What stopped the capture for good was a branch being stopped while still linked to
+        the tee: its FLUSHING return travelled back up through the queues. Taking the branch
+        off the tee first (remove_peer) is the actual fix. This always-ready branch is only a
+        belt and braces extra: it keeps the tee from ever having zero branches, but it does
+        NOT make the tee ignore a bad return from some other branch (GStreamer's tee stops on
+        any return other than OK or NOT_LINKED), so a branch must still never be stopped
+        while it is linked."""
+        try:
+            q = Gst.ElementFactory.make("queue", "drainq")
+            sink = Gst.ElementFactory.make("fakesink", "drain")
+            q.set_property("leaky", 2)  # downstream: never block
+            q.set_property("max-size-buffers", 10)
+            q.set_property("max-size-bytes", 0)
+            q.set_property("max-size-time", 0)
+            sink.set_property("sync", False)
+            sink.set_property("async", False)
+            self.pipeline.add(q)
+            self.pipeline.add(sink)
+            if not q.link(sink):
+                raise RuntimeError("could not link the drain queue")
+            pad = self.tee.get_request_pad("src_%u")
+            if pad is None or pad.link(q.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("could not link the tee to the drain queue")
+            self._drain_pad = pad
+        except Exception as e:
+            self._drain_pad = None
+            print(f"[tee drain branch unavailable: {e}]", file=sys.stderr)
+
+    def build_pipeline(self):
+        # latency: with the live keep-alive input the mixer runs in live mode, where
+        # audio arriving later than its deadline is dropped. Network audio always
+        # arrives a little late, so give it 200 ms of slack.
+        playback = f"audiomixer name=mix latency=200000000 ! audioconvert ! audioresample ! {self.sink}"
+        # A permanent live silent input keeps the mixer producing output even
+        # when no peer is sending. Without it the mixer waits for audio, the
+        # sink never prerolls, and the WHOLE pipeline (including the capture
+        # branch that VOX listens to) stays paused until someone talks.
+        keepalive = "audiotestsrc is-live=true wave=silence ! mix."
+
+        try:
+            self.pipeline = Gst.parse_launch(f"{self._capture_chain(True)}  {playback}  {keepalive}")
+        except Exception as e:
+            if not (self.vox and self.preroll_ms > 0):
+                raise
+            # The pre-roll is a convenience; never let it stop the gateway from starting.
+            print(f"[pre-roll unavailable ({e}); running without it]", file=sys.stderr)
+            self.preroll_ms = 0
+            self.pipeline = Gst.parse_launch(f"{self._capture_chain(False)}  {playback}  {keepalive}")
+        self.tee = self.pipeline.get_by_name("t")
+        self.tee.set_property("allow-not-linked", True)  # fine to have zero peers connected
+        # Count what reaches the tee so the watchdog can tell a stuck send path from a stuck input.
+        self.tee.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._count_tee_buffer)
+        self._add_drain_branch()
+        self.mixer = self.pipeline.get_by_name("mix")
+        self.mic_mute = self.pipeline.get_by_name("mic-mute")
+        self._build_beep_branch()
+
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_bus_error)
+        # Always: the per-peer RX level meters report here even without VOX.
+        bus.connect("message::element", self.on_bus_element)
+        if self.vox:
+            GLib.timeout_add_seconds(5, self._check_levels_flowing)
+            GLib.timeout_add_seconds(5, self._levels_watchdog)
+            if self.vox_debug:
+                GLib.timeout_add_seconds(5, self._debug_status)
+
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+        # bus.add_signal_watch() dispatches through the GLib main context —
+        # without a running main loop, error messages are silently never delivered.
+        self.glib_loop = GLib.MainLoop()
+        threading.Thread(target=self.glib_loop.run, daemon=True).start()
+
+    def _build_beep_branch(self):
+        """
+        A muted tone generator feeding the playback mixer, for the roger beep.
+        Built apart from the main pipeline string on purpose: if anything here
+        fails, the beep is simply unavailable and the rest of the pipeline is
+        exactly what it was without this feature.
+        """
+        src = gate = None
+        try:
+            src = Gst.ElementFactory.make("audiotestsrc", "beep-src")
+            gate = Gst.ElementFactory.make("volume", "beep-gate")
+            if src is None or gate is None:
+                raise RuntimeError("audiotestsrc/volume element missing")
+            src.set_property("is-live", True)
+            src.set_property("freq", float(BEEP_PATTERN[0][0]))
+            src.set_property("volume", BEEP_VOLUME)
+            try:
+                Gst.util_set_object_arg(src, "wave", "triangle")
+            except Exception:
+                pass  # keeps the default sine: plainer, but still a working beep
+            gate.set_property("mute", True)
+            self.pipeline.add(src)
+            self.pipeline.add(gate)
+            if not src.link(gate):
+                raise RuntimeError("could not link the tone generator")
+            pad = self.mixer.get_request_pad("sink_%u")
+            if pad is None or gate.get_static_pad("src").link(pad) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("could not link the tone generator to the mixer")
+            self.beep_gate = gate
+            self.beep_src = src
+        except Exception as e:
+            self.beep_gate = None
+            self.beep_src = None
+            print(f"[roger beep unavailable: {e}]", file=sys.stderr)
+
+    def play_roger_beep(self):
+        """Play BEEP_PATTERN through the muted gate. Returns how long it takes (0 = nothing played)."""
+        if self.beep_gate is None or self.beep_src is None:
+            return 0
+        try:
+            self._cancel_beep_timers()
+            offset = 0
+            for freq, ms in BEEP_PATTERN:
+                self._beep_timers.append(self.loop.call_later(offset / 1000.0, self._beep_note, freq))
+                offset += ms
+            self._beep_timers.append(self.loop.call_later(offset / 1000.0, self._end_beep))
+        except Exception:
+            self._end_beep()
+            return 0
+        return BEEP_MS
+
+    def _beep_note(self, freq):
+        if self.beep_gate is None or self.beep_src is None:
+            return
+        try:
+            self.beep_src.set_property("freq", float(freq))
+            self.beep_gate.set_property("mute", False)
+        except Exception:
+            pass
+
+    def _cancel_beep_timers(self):
+        timers, self._beep_timers = self._beep_timers, []
+        for handle in timers:
+            handle.cancel()
+
+    def _end_beep(self):
+        # Also drop any notes still scheduled: they would reopen the gate
+        # after a reset or into the next transmission.
+        self._cancel_beep_timers()
+        if self.beep_gate is None:
+            return
+        try:
+            self.beep_gate.set_property("mute", True)
+        except Exception:
+            pass
+
+    def _status(self, text):
+        """
+        One-line state changes. On an interactive terminal they overwrite each
+        other in place; everywhere else (systemd/journal, pipes, --vox-debug)
+        each one is its own line, so none are lost or garbled by carriage returns.
+        """
+        if sys.stdout.isatty() and not self.vox_debug:
+            print("\r" + text.ljust(40), end="", flush=True)
+        else:
+            print(text, flush=True)
+
+    def _log_sdp(self, label, sdp_text):
+        """--vox-debug: show the audio lines of an SDP (direction and codec)."""
+        if not self.vox_debug:
+            return
+        keep = ("m=", "a=sendrecv", "a=recvonly", "a=sendonly", "a=inactive", "a=rtpmap", "a=mid")
+        lines = [ln.strip() for ln in sdp_text.splitlines() if ln.startswith(keep)]
+        # Peer-controlled text: strip terminal control characters, bound the size.
+        print(f"[sdp] {label}: " + safe_text(" | ".join(lines), limit=1000), file=sys.stderr)
+
+    @staticmethod
+    def _rss_mb():
+        """Resident memory of this process in MB (Linux), or -1 if unknown."""
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) // 1024
+        except (OSError, ValueError):
+            pass
+        return -1
+
+    def _queue_report(self):
+        """--vox-debug: fill level of each peer's audio queues, to spot a backlog."""
+        parts = []
+        for peer in list(self.peers.values()):
+            for label, el in (("send", peer.send_queue), ("recv", peer.recv_elements[0] if peer.recv_elements else None)):
+                if el is None:
+                    continue
+                try:
+                    bufs = el.get_property("current-level-buffers")
+                    kb = el.get_property("current-level-bytes") // 1024
+                    parts.append(f"{label}-queue {bufs} buf/{kb} KB")
+                except Exception:
+                    parts.append(f"{label}-queue ?")
+        return ", ".join(parts) or "no queues"
+
+    def _debug_status(self):
+        n = self._level_msgs
+        delta, self._dbg_status_last = n - self._dbg_status_last, n
+        quiet_peak, self._dbg_window_peak = self._dbg_window_peak, float("-inf")
+        state = self.pipeline.get_state(0)[1].value_nick
+        print(
+            f"[vox] status: {delta} level readings in 5 s, input peak {quiet_peak:.1f} dBFS, "
+            f"pipeline {state}, {len(self.peers)} peer(s), floor holder {self.floor_holder!r}, "
+            f"radio keyed {bool(self.ptt and self.ptt.keyed)}, memory {self._rss_mb()} MB, "
+            f"python objects {sys.getallocatedblocks()}, threads {threading.active_count()}, "
+            f"{self._queue_report()}",
+            file=sys.stderr,
+        )
+        return True  # repeat
+
+    def _check_levels_flowing(self):
+        if self._level_msgs == 0:
+            print(
+                "[vox] WARNING: no audio-level readings from the input after 5 s — the "
+                "capture device may be stalled, busy or the wrong --alsa-device/--source",
+                file=sys.stderr,
+            )
+        return False  # one-shot
+
+    def _levels_watchdog(self):
+        """Runs on the GLib thread every 5 s. If the radio input has produced no level
+        readings for LEVEL_STALL_SECONDS, restart the whole process.
+
+        os._exit, not sys.exit: the stuck part is native GStreamer code, and a normal
+        shutdown would wait for it. The radio is unkeyed first so it can never be left
+        transmitting. systemd brings the service back after RestartSec."""
+        levels, sent = self._level_msgs, self._tee_buffers
+        levels_delta, sent_delta = levels - self._wd_last_levels, sent - self._wd_last_sent
+        levels_moved = levels_delta != 0
+        sent_moved = sent_delta != 0
+        self._wd_last_levels, self._wd_last_sent = levels, sent
+        # The send path only counts once it has been seen working, so a probe that
+        # never fires can never cause a restart loop.
+        send_stuck = self._wd_sent_seen and not sent_moved
+        if sent_moved:
+            self._wd_sent_seen = True
+        if levels_moved and not send_stuck:
+            self._wd_quiet_ticks = 0
+            return True  # repeat
+        self._wd_quiet_ticks += 1
+        # Tells the two failure shapes apart: audio still flowing through the
+        # pipeline (the level messages are what stopped) or the audio itself stopped.
+        print(
+            f"[watchdog] quiet {self._wd_quiet_ticks * 5}/{LEVEL_STALL_SECONDS} s: level readings {levels_delta:+d}, "
+            f"audio buffers reaching the tee {sent_delta:+d}",
+            file=sys.stderr, flush=True,
+        )
+        if self._wd_quiet_ticks * 5 >= LEVEL_STALL_SECONDS:
+            what = "radio-input level readings" if not levels_moved else "audio reaching the send path"
+            op = self._last_peer_op
+            last = f"{op[0]} {op[1]} {time.monotonic() - op[2]:.0f} s ago" if op else "none"
+            print(
+                f"[watchdog] no {what} for {LEVEL_STALL_SECONDS} s ({len(self.peers)} peer(s); "
+                f"last peer operation: {last}); restarting the gateway. Python thread stacks follow:",
+                file=sys.stderr, flush=True,
+            )
+            self._dump_native_threads()
+            try:
+                # Shows which call (if any) the main thread is stuck in.
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            except Exception:
+                pass
+            try:
+                if self.ptt is not None:
+                    self.ptt.unkey()
+            except Exception:
+                pass
+            os._exit(1)
+        return True  # repeat
+
+    @staticmethod
+    def _dump_native_threads(task_dir="/proc/self/task"):
+        """Every OS thread of this process, GStreamer streaming threads included:
+        its name, its state, and the kernel function it is sleeping in. Python's
+        traceback cannot see native threads; this shows which one is stuck and on what."""
+        try:
+            tids = sorted(os.listdir(task_dir), key=int)
+        except Exception:
+            return  # not Linux, or no access: the Python stacks still follow
+
+        def read(tid, name):
+            try:
+                with open(os.path.join(task_dir, tid, name)) as f:
+                    return f.read().strip()
+            except Exception:
+                return "?"
+
+        for tid in tids:
+            stat = read(tid, "stat")
+            state = stat.rsplit(")", 1)[-1].split()[0] if ")" in stat and stat.rsplit(")", 1)[-1].split() else "?"
+            print(
+                f"[thread] {tid} {safe_text(read(tid, 'comm'))!r} state={state} wchan={safe_text(read(tid, 'wchan'))}",
+                file=sys.stderr, flush=True,
+            )
+
+    def _control_pulse(self):
+        """Runs on the asyncio thread every 250 ms; proves that thread is alive."""
+        self._control_seen = time.monotonic()
+        self.loop.call_later(0.25, self._control_pulse)
+
+    def _check_control_progress(self):
+        """Runs on the GLib thread every second. The PTT timers and the floor logic live on the
+        asyncio thread, which also does synchronous native work (peer teardown). If that thread
+        is stuck the radio could stay keyed while capture still looks healthy, so the audio
+        watchdog would not notice. Unkey from here and restart."""
+        seen = self._control_seen
+        if seen is not None and time.monotonic() - seen > CONTROL_STALL_SECONDS:
+            print(
+                f"[watchdog] the control loop has not run for {CONTROL_STALL_SECONDS} s "
+                f"(last peer operation: {self._last_peer_op[0] if self._last_peer_op else 'none'}); "
+                "unkeying and restarting the gateway.",
+                file=sys.stderr, flush=True,
+            )
+            self._dump_native_threads()
+            try:
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            except Exception:
+                pass
+            self._fatal_exit("control loop stalled")
+        return True  # repeat
+
+    def _count_tee_buffer(self, pad, info):
+        self._tee_buffers += 1
+        return Gst.PadProbeReturn.OK
+
+    def _note_peer_op(self, what, peer_id):
+        self._last_peer_op = (what, peer_id, time.monotonic())
+
+    DEVICE_ELEMENT_PREFIXES = ("alsa", "autoaudio", "pulse", "pipewire")
+
+    def on_bus_error(self, bus, message):
+        err, debug = message.parse_error()
+        print(f"[gst error] {err} ({debug})", file=sys.stderr)
+        # An error from the sound device itself (USB card unplugged, driver
+        # fault) leaves a gateway that is connected but deaf or mute, and no
+        # other watchdog can tell. Unkey and let systemd restart us. Errors
+        # from a peer's branch are not fatal: one bad phone must not be able
+        # to restart the gateway.
+        src = getattr(message, "src", None)
+        name = src.get_name() if src is not None else ""
+        if isinstance(name, str) and name.startswith(self.DEVICE_ELEMENT_PREFIXES):
+            self._fatal_exit(f"sound device error from {name}: {err}")
+
+    def _fatal_exit(self, reason):
+        print(f"[fatal] {reason}; unkeying and restarting the gateway.", file=sys.stderr, flush=True)
+        try:
+            if self.ptt:
+                self.ptt.unkey()
+        except Exception:
+            pass
+        os._exit(1)
+
+    # ---------- radio gateway: VOX (radio -> LAN) ----------
+
+    def on_bus_element(self, bus, message):
+        s = message.get_structure()
+        if s is None or s.get_name() != "level":
+            return
+        level_db = self._level_from_structure(s)
+        if level_db is None:
+            return
+        # A peer's receive meter, not the radio input VOX listens to.
+        src_name = message.src.get_name() if message.src else ""
+        if src_name.startswith("rxlvl-"):
+            peak_db = self._level_from_structure(s, "peak")
+            self.record_rx_level(src_name[len("rxlvl-"):], level_db, level_db if peak_db is None else peak_db)
+            return
+        if not self.vox:
+            return
+        self._level_msgs += 1
+        if self.vox_debug:
+            self._dbg_peak = max(self._dbg_peak, level_db)
+            self._dbg_window_peak = max(self._dbg_window_peak, level_db)
+            now = time.monotonic()
+            if now - self._dbg_last >= 1.0:
+                # Idle noise is summarised in the 5 s status line; only audio
+                # near or above the threshold gets its own line.
+                if self._dbg_peak > self.vox.threshold_db - 10:
+                    print(
+                        f"[vox] input peak {self._dbg_peak:6.1f} dBFS (threshold {self.vox.threshold_db:.0f})",
+                        file=sys.stderr,
+                    )
+                self._dbg_peak = float("-inf")
+                self._dbg_last = now
+        blocked = (self.ptt is not None and self.ptt.keyed) or time.monotonic() < self._vox_blocked_until
+        # Don't ask for the floor while someone else holds it or we have no
+        # session; the radio audio has nowhere to go.
+        # (my_id is set when the server's welcome arrives, right before our join.)
+        if self.ws is None or self.my_id is None or (self.floor_holder not in (None, self.my_id)):
+            blocked = True
+        event = self.vox.update(level_db, LEVEL_INTERVAL_NS / 1e6, blocked=blocked)
+        if self.squelch == "off":
+            self._watch_stuck_open()
+        if event == "start":
+            self._status("[radio: carrier/voice detected]")
+            asyncio.run_coroutine_threadsafe(self.start_talk(), self.loop)
+        elif event == "stop":
+            asyncio.run_coroutine_threadsafe(self.stop_talk(), self.loop)
+
+    def _watch_stuck_open(self):
+        """
+        Squelch off only. If the radio input never goes quiet, the idle noise is above the
+        threshold and the gateway holds the channel for good (the server frees it after its
+        transmit limit, and the gateway just asks again). Say so once per stretch.
+        """
+        now = time.monotonic()
+        if not self.vox.active:
+            self._open_since = None
+            self._open_warned = False
+            return
+        if self._open_since is None:
+            self._open_since = now
+        elif not self._open_warned and now - self._open_since > STUCK_OPEN_SECONDS:
+            self._open_warned = True
+            print(
+                f"[squelch OFF: the radio input has not gone quiet for {STUCK_OPEN_SECONDS} s. The idle noise "
+                f"is probably above the threshold ({self.vox.threshold_db:.0f} dBFS), so the channel stays "
+                f"occupied. Raise it with --vox-threshold-db (see --vox-debug), or set LAN_WALKIE_SQUELCH=on]",
+                file=sys.stderr,
+            )
+
+    @staticmethod
+    def _level_from_structure(s, field="rms"):
+        try:
+            values = s.get_value(field)
+            if values:
+                return max(float(v) for v in values)
+        except Exception:
+            pass
+        # Some PyGObject builds don't convert GValueArray; parse the text form.
+        # Seen on Ubuntu 24.04: "rms=(GValueArray)< -48.4, -48.4 >". Older
+        # builds use (double) and/or { } instead, so accept any type tag.
+        m = re.search(rf"{field}=\([A-Za-z]+\)[<{{]\s*([^>}}]*)[>}}]", s.to_string())
+        if m:
+            try:
+                return max(float(v) for v in m.group(1).split(","))
+            except ValueError:
+                return None
+        return None
+
+    # ---------- LAN -> radio: how loud is each talker? ----------
+
+    def record_rx_level(self, peer_id, rms_db, peak_db):
+        # Frames below -60 dBFS are the gaps between words; counting them would
+        # drag the average down and hide how loud the speech itself is.
+        if rms_db < -60:
+            return
+        st = self.rx_stats.setdefault(peer_id, {"n": 0, "pow": 0.0, "peak": -200.0})
+        st["n"] += 1
+        st["pow"] += 10 ** (rms_db / 10)
+        st["peak"] = max(st["peak"], peak_db)
+
+    def report_rx_level(self, peer_id):
+        """Print how loud a peer was over the transmission that just ended."""
+        st = self.rx_stats.pop(peer_id, None)
+        peer = self.peers.get(peer_id)
+        name = safe_text(peer.name) if peer else str(peer_id)
+        if not st or st["n"] < 5:  # under ~250 ms of speech (50 ms meter interval): a click, not a transmission
+            print(f"[rx level] {name}: no usable audio received", file=sys.stderr, flush=True)
+            return
+        avg = 10 * math.log10(st["pow"] / st["n"])
+        if avg < -35:
+            verdict = "very quiet"
+        elif avg < -28:
+            verdict = "quiet"
+        elif st["peak"] > -1:
+            verdict = "clipping"
+        else:
+            verdict = "ok"
+        gain = f", before +{self.rx_gain_db:g} dB gain" if self.rx_gain_db else ""
+        print(
+            f"[rx level] {name}: speech avg {avg:.1f} dBFS, peak {st['peak']:.1f} dBFS ({verdict}{gain})",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    # ---------- radio gateway: PTT (LAN -> radio) ----------
+
+    def radio_key(self):
+        if not self.ptt:
+            return
+        if self._unkey_handle:
+            self._unkey_handle.cancel()
+            self._unkey_handle = None
+        if not self.ptt.keyed:
+            self.ptt.key()
+            self._status("[radio: TX keyed]")
+        # Watchdog: the server's own transmit timeout should end a floor
+        # first; this is the local backstop that guarantees the radio never
+        # stays keyed if signaling or a peer misbehaves. It limits how long
+        # the radio stays CONTINUOUSLY keyed, so it is armed once, when the
+        # key goes down, and survives tails and speaker handovers. Only a
+        # real unkey (_do_unkey) clears it.
+        if self._ptt_watchdog is None:
+            self._ptt_watchdog = self.loop.call_later(self.max_ptt_seconds, self._watchdog_unkey)
+
+    def _watchdog_unkey(self):
+        print("\n[radio: max PTT time reached — unkeying]", file=sys.stderr)
+        # This timer has fired, so its handle is spent. If the unkey fails
+        # (serial error), a stale handle would stop radio_key() from ever
+        # arming another watchdog: keep trying until the write succeeds.
+        self._ptt_watchdog = None
+        try:
+            self.radio_unkey(immediate=True)
+        except Exception as e:
+            print(f"[radio: UNKEY FAILED ({e}); retrying in 1 s]", file=sys.stderr, flush=True)
+            self._ptt_watchdog = self.loop.call_later(1.0, self._watchdog_unkey)
+
+    def radio_unkey(self, immediate=False, extra_ms=0):
+        """extra_ms: hold the key that much longer, so a roger beep finishes on air."""
+        if not self.ptt:
+            return
+        # The max-PTT watchdog is deliberately left running here: a tail that
+        # gets cancelled by the next speaker must not restart the clock.
+        if self._unkey_handle:
+            self._unkey_handle.cancel()
+            self._unkey_handle = None
+        tail_ms = self.ptt_tail_ms + extra_ms
+        if immediate or tail_ms <= 0:
+            self._do_unkey()
+        elif self.ptt.keyed:
+            # Short tail so the last syllable isn't cut off at the radio.
+            self._unkey_handle = self.loop.call_later(tail_ms / 1000.0, self._do_unkey)
+
+    def _do_unkey(self):
+        self._unkey_handle = None
+        was_keyed = self.ptt.keyed
+        self.ptt.unkey()  # always write the idle state, as a safety measure
+        # Only now, with the write done, is the continuous-keying clock over.
+        if self._ptt_watchdog:
+            self._ptt_watchdog.cancel()
+            self._ptt_watchdog = None
+        if not was_keyed:
+            # Nothing was transmitting, so there is no TX leak to wait out.
+            # Blocking VOX here would cancel our own radio->LAN transmission:
+            # taking the floor calls this, and the block would make VOX report
+            # "stop" right after "start" (the floor flapped on and off).
+            return
+        # Squelch tail / TX audio can leak into the input right after unkey.
+        self._vox_blocked_until = time.monotonic() + 0.5
+        self._status("[radio: TX released]")
+
+    # ---------- WebRTC ----------
+
+    def create_peer_connection(self, peer, initiator):
+        peer_id = peer.id
+        self._note_peer_op("add-start", peer_id)
+        webrtcbin = Gst.ElementFactory.make("webrtcbin", f"peer-{peer_id}")
+        webrtcbin.set_property("bundle-policy", "max-bundle")
+        configure_upnp(webrtcbin, self.upnp)
+        if self.stun:
+            webrtcbin.set_property("stun-server", self.stun)
+
+        # Attach EVERY listener before the element joins the pipeline. webrtcbin
+        # raises "negotiation needed" once; if that happens while it is being
+        # started and nobody is listening yet, the gateway never sends its offer
+        # and the peer connection never starts (floor messages still work over
+        # the server, so it looks half-alive but carries no audio).
+        peer.signal_handlers.append(webrtcbin.connect("on-ice-candidate", self.on_ice_candidate, peer_id))
+        peer.signal_handlers.append(webrtcbin.connect("pad-added", self.on_pad_added, peer))
+        peer.signal_handlers.append(webrtcbin.connect(
+            "notify::ice-connection-state",
+            lambda wb, _pspec, pid=peer_id: print(
+                f"[ice:{pid}] {wb.get_property('ice-connection-state').value_name}", file=sys.stderr
+            ),
+        ))
+        if initiator:
+            peer.signal_handlers.append(webrtcbin.connect("on-negotiation-needed", self.on_negotiation_needed, peer_id))
+
+        self.pipeline.add(webrtcbin)
+
+        # Fan the shared outgoing audio into this peer's connection, through
+        # a small leaky queue. Without it, a peer whose webrtcbin isn't
+        # accepting data yet blocks the single capture streaming thread, which
+        # also starves the level meter VOX depends on (radio -> LAN dies while
+        # LAN -> radio keeps working).
+        send_queue = Gst.ElementFactory.make("queue")
+        send_queue.set_property("leaky", 2)  # downstream: drop oldest, never block
+        send_queue.set_property("max-size-buffers", 0)
+        send_queue.set_property("max-size-bytes", 0)
+        send_queue.set_property("max-size-time", 200_000_000)  # 200 ms
+        self.pipeline.add(send_queue)
+        # Encode once, but packetize separately: each peer negotiates its own
+        # RTP payload number (Chrome commonly offers 111, our offers use 96).
+        pay = Gst.ElementFactory.make("rtpopuspay")
+        pay.set_property("pt", peer.opus_payload)
+        caps = Gst.ElementFactory.make("capsfilter")
+        caps.set_property("caps", Gst.Caps.from_string(
+            "application/x-rtp,media=audio,encoding-name=OPUS,"
+            f"payload={peer.opus_payload},clock-rate=48000,encoding-params=(string)2"))
+        self.pipeline.add(pay)
+        self.pipeline.add(caps)
+        send_queue.link(pay)
+        pay.link(caps)
+        sink_pad = webrtcbin.get_request_pad("sink_%u")
+        peer.webrtc_sink_pad = sink_pad
+        caps.get_static_pad("src").link(sink_pad)
+        peer.send_payloader = pay
+        peer.send_caps = caps
+        peer.send_queue = send_queue
+        peer.send_ready = True
+
+        # All pads/caps exist before PLAYING can trigger negotiation. Attach
+        # the live tee only after the entire downstream branch is ready.
+        webrtcbin.sync_state_with_parent()
+        for el in (caps, pay, send_queue):
+            el.sync_state_with_parent()
+        tee_pad = self.tee.get_request_pad("src_%u")
+        tee_pad.link(send_queue.get_static_pad("sink"))
+        peer.tee_pad = tee_pad
+        if initiator:
+            self.on_negotiation_needed(webrtcbin, peer_id)
+
+        self._note_peer_op("add-done", peer_id)
+        return webrtcbin
+
+    def on_negotiation_needed(self, webrtcbin, peer_id):
+        peer = self.peers.get(peer_id)
+        # This client has one fixed local audio track. Coalesce initial
+        # notifications; never send an empty offer before its sink pad exists.
+        if peer is None or not peer.send_ready or peer.offer_started:
+            return
+        peer.offer_started = True
+        if self.vox_debug:
+            print(f"[gw] negotiation needed for {peer_id}: sending an offer", file=sys.stderr)
+        promise = Gst.Promise.new_with_change_func(self.on_offer_created, webrtcbin, peer_id)
+        webrtcbin.emit("create-offer", None, promise)
+
+    def on_offer_created(self, promise, webrtcbin, peer_id):
+        promise.wait()
+        reply = promise.get_reply()
+        offer = reply.get_value("offer")
+        self._log_sdp("our offer", offer.sdp.as_text())
+        set_promise = Gst.Promise.new()
+        webrtcbin.emit("set-local-description", offer, set_promise)
+        set_promise.interrupt()
+        self._send_threadsafe(
+            {"type": "offer", "target": peer_id, "sdp": {"type": "offer", "sdp": offer.sdp.as_text()}}
+        )
+
+    def handle_offer(self, peer_id, sdp_text):
+        peer = self.peers[peer_id]
+        payload = offered_opus_payload(sdp_text)
+        if peer.webrtcbin is None:
+            peer.opus_payload = payload
+            peer.webrtcbin = self.create_peer_connection(peer, initiator=False)
+        elif peer.opus_payload != payload or peer.offer_applied:
+            # Start over with a fresh connection when (a) the browser's codec
+            # numbering differs from what our sending branch was built for, or
+            # (b) this is a SECOND offer from the same browser, which happens
+            # when it rebuilds its own connection after a network drop: the new
+            # connection has a new DTLS identity, so the old webrtcbin cannot
+            # take it. The shared encoder and other peers' streams are untouched.
+            name, priority = peer.name, peer.priority
+            self.remove_peer(peer_id)
+            peer = Peer(peer_id, name, priority)
+            self.peers[peer_id] = peer
+            peer.opus_payload = payload
+            peer.webrtcbin = self.create_peer_connection(peer, initiator=False)
+
+        self._log_sdp("remote offer", sdp_text)
+        ok, sdpmsg = GstSdp.SDPMessage.new()
+        GstSdp.sdp_message_parse_buffer(sdp_text.encode(), sdpmsg)
+        offer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.OFFER, sdpmsg)
+
+        set_promise = Gst.Promise.new()
+        peer.webrtcbin.emit("set-remote-description", offer, set_promise)
+        set_promise.interrupt()
+        peer.offer_applied = True
+
+        for candidate in peer.pending_ice:
+            peer.webrtcbin.emit("add-ice-candidate", candidate[0], candidate[1])
+        peer.pending_ice.clear()
+
+        answer_promise = Gst.Promise.new_with_change_func(self.on_answer_created, peer)
+        peer.webrtcbin.emit("create-answer", None, answer_promise)
+
+    def on_answer_created(self, promise, peer):
+        promise.wait()
+        reply = promise.get_reply()
+        answer = reply.get_value("answer")
+        self._log_sdp("our answer", answer.sdp.as_text())
+        set_promise = Gst.Promise.new()
+        peer.webrtcbin.emit("set-local-description", answer, set_promise)
+        set_promise.interrupt()
+        self._send_threadsafe(
+            {"type": "answer", "target": peer.id, "sdp": {"type": "answer", "sdp": answer.sdp.as_text()}}
+        )
+
+    def handle_answer(self, peer_id, sdp_text):
+        peer = self.peers.get(peer_id)
+        if not peer or not peer.webrtcbin:
+            return
+        ok, sdpmsg = GstSdp.SDPMessage.new()
+        GstSdp.sdp_message_parse_buffer(sdp_text.encode(), sdpmsg)
+        answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdpmsg)
+        promise = Gst.Promise.new()
+        peer.webrtcbin.emit("set-remote-description", answer, promise)
+        promise.interrupt()
+
+    def on_ice_candidate(self, webrtcbin, mlineindex, candidate, peer_id):
+        self._send_threadsafe(
+            {"type": "ice", "target": peer_id, "candidate": {"candidate": candidate, "sdpMLineIndex": mlineindex}}
+        )
+
+    def handle_remote_ice(self, peer_id, candidate_dict):
+        peer = self.peers.get(peer_id)
+        if not peer or not isinstance(candidate_dict, dict):
+            return
+        candidate = candidate_dict.get("candidate")
+        mlineindex = candidate_dict.get("sdpMLineIndex", 0)
+        if candidate:
+            if peer.webrtcbin is None:
+                if len(peer.pending_ice) < 256:
+                    peer.pending_ice.append((mlineindex, candidate))
+            else:
+                peer.webrtcbin.emit("add-ice-candidate", mlineindex, candidate)
+
+    def on_pad_added(self, webrtcbin, pad, peer):
+        if pad.direction != Gst.PadDirection.SRC:
+            return
+        # One audio receive chain per peer. A renegotiation that adds more
+        # m-lines would otherwise overwrite the cleanup references and leak
+        # the first chain's elements and mixer pad.
+        if peer.mixer_pad is not None or peer.recv_elements:
+            return
+        queue = Gst.ElementFactory.make("queue")
+        depay = Gst.ElementFactory.make("rtpopusdepay")
+        dec = Gst.ElementFactory.make("opusdec")
+        conv = Gst.ElementFactory.make("audioconvert")
+        resample = Gst.ElementFactory.make("audioresample")
+        # Measures this peer's audio as received, before any --rx-gain.
+        lvl = Gst.ElementFactory.make("level", f"rxlvl-{peer.id}")
+        lvl.set_property("interval", 50_000_000)
+        lvl.set_property("post-messages", True)
+        chain = [queue, depay, dec, conv, resample, lvl]
+        if self.rx_gain_db:
+            # Per peer, before the mixer, so the roger beep (which also goes through the
+            # mixer) keeps its own volume. The volume element hard-clips above full scale.
+            gain = Gst.ElementFactory.make("volume")
+            gain.set_property("volume", 10 ** (self.rx_gain_db / 20))
+            chain.append(gain)
+
+        for el in chain:
+            self.pipeline.add(el)
+            el.sync_state_with_parent()
+        peer.recv_elements = chain
+
+        pad.link(queue.get_static_pad("sink"))
+        for upstream, downstream in zip(chain, chain[1:]):
+            upstream.link(downstream)
+
+        mixer_pad = self.mixer.get_request_pad("sink_%u")
+        chain[-1].get_static_pad("src").link(mixer_pad)
+        peer.mixer_pad = mixer_pad
+
+    def remove_peer(self, peer_id):
+        peer = self.peers.pop(peer_id, None)
+        self.rx_stats.pop(peer_id, None)
+        if not peer:
+            return
+        self._note_peer_op("remove-start", peer_id)
+
+        # FIRST take the branch off the tee, while it is still healthy. Stopping its
+        # elements while the tee can still push into it makes that push return
+        # FLUSHING, which travels back up through the queues and stops the capture.
+        if peer.tee_pad:
+            self.tee.release_request_pad(peer.tee_pad)
+            peer.tee_pad = None
+
+        if peer.webrtcbin:
+            # The pad-added closure owns peer, which owns webrtcbin. Explicitly
+            # break this cross-language cycle before removing the element.
+            for handler in peer.signal_handlers:
+                peer.webrtcbin.disconnect(handler)
+            peer.signal_handlers.clear()
+            peer.webrtcbin.set_state(Gst.State.NULL)
+            if peer.webrtc_sink_pad is not None:
+                peer.webrtcbin.release_request_pad(peer.webrtc_sink_pad)
+                peer.webrtc_sink_pad = None
+            self.pipeline.remove(peer.webrtcbin)
+            peer.webrtcbin = None
+
+        if peer.send_queue:
+            peer.send_queue.set_state(Gst.State.NULL)
+            self.pipeline.remove(peer.send_queue)
+        for el in (peer.send_payloader, peer.send_caps):
+            if el is not None:
+                el.set_state(Gst.State.NULL)
+                self.pipeline.remove(el)
+
+        for el in peer.recv_elements:
+            el.set_state(Gst.State.NULL)
+            self.pipeline.remove(el)
+
+        if peer.mixer_pad:
+            self.mixer.release_request_pad(peer.mixer_pad)
+
+        peer.tee_pad = None
+        peer.send_queue = None
+        peer.send_payloader = None
+        peer.send_caps = None
+        peer.send_ready = False
+        peer.pending_ice.clear()
+        peer.mixer_pad = None
+        peer.recv_elements.clear()
+        self._note_peer_op("remove-done", peer_id)
+
+    def reset_for_reconnect(self):
+        """
+        Tear down everything tied to the old signaling connection so the next
+        one starts clean. Peer ids and floor state come from the server and
+        are meaningless once we've lost it — a stale webrtcbin left over from
+        before the drop would just confuse renegotiation with whatever's
+        handed out after we reconnect.
+
+        The radio is unkeyed FIRST, before anything that touches native
+        GStreamer objects: with no signaling nobody can be authorized to
+        transmit through it, and a teardown that blocked on this thread would
+        also block the watchdog that shares the event loop.
+        """
+        self.radio_unkey(immediate=True)
+        self.mic_mute.set_property("mute", True)
+        self._end_beep()
+        self.talking = False
+        self.have_floor = False
+        if self.vox:
+            self.vox.reset()
+        for pid in list(self.peers.keys()):
+            self.remove_peer(pid)
+        self.my_id = None
+        self.floor_holder = None
+
+    # ---------- signaling ----------
+
+    def _send_threadsafe(self, msg):
+        # GStreamer callbacks fire on GLib/Gst threads, not the asyncio thread.
+        asyncio.run_coroutine_threadsafe(self.send(msg), self.loop)
+
+    async def send(self, msg):
+        if self.ws:
+            await self.ws.send(json.dumps(msg))
+
+    async def handle_message(self, raw):
+        msg = json.loads(raw)
+        if not isinstance(msg, dict):
+            return
+        mtype = msg.get("type")
+
+        if mtype == "welcome":
+            self.my_id = msg["id"]
+            self.roger_beep = msg.get("rogerBeep") is True
+            print(f"[roger beep: {'ON' if self.roger_beep else 'off'} (server setting)]", flush=True)
+            token =self.token if self.verified else None
+            await self.send({"type": "join", "name": self.name, "token": token})
+
+        elif mtype == "peers":
+            incoming_ids = {p["id"] for p in msg["peers"]}
+            # Drop departed peers first so cleanup can't be skipped by a
+            # later failure while printing.
+            for pid in list(self.peers.keys()):
+                if pid not in incoming_ids:
+                    name = safe_text(self.peers[pid].name)
+                    self.remove_peer(pid)
+                    print(f"-> {name} left")
+            for p in msg["peers"]:
+                if p["id"] not in self.peers:
+                    peer = Peer(p["id"], p["name"], priority=bool(p.get("priority", False)))
+                    self.peers[p["id"]] = peer
+                    initiator = self.my_id < p["id"]
+                    if initiator:
+                        peer.webrtcbin = self.create_peer_connection(peer, initiator=True)
+                    marker = "[priority] " if peer.priority else ""
+                    print(f"-> {marker}{safe_text(p['name'])} joined")
+
+        elif mtype == "offer":
+            if msg["from"] not in self.peers:
+                self.peers[msg["from"]] = Peer(msg["from"], msg.get("name", "?"))
+            self.handle_offer(msg["from"], msg["sdp"]["sdp"])
+
+        elif mtype == "answer":
+            self.handle_answer(msg["from"], msg["sdp"]["sdp"])
+
+        elif mtype == "ice":
+            self.handle_remote_ice(msg["from"], msg.get("candidate"))
+
+        elif mtype == "floor":
+            previous_holder = self.floor_holder
+            self.floor_holder = msg.get("holder")
+            name = safe_text(msg.get("name"))
+            if previous_holder and previous_holder != self.my_id and previous_holder != self.floor_holder:
+                self.report_rx_level(previous_holder)
+            if self.floor_holder and self.floor_holder != self.my_id:
+                self.rx_stats.pop(self.floor_holder, None)  # fresh numbers per transmission
+            if self.floor_holder == self.my_id:
+                if self._beep_timers:
+                    self._end_beep()  # an old courtesy tone must not ride into this transmission
+                if not self.talking:
+                    # The grant arrived after we had already let go (a ptt-stop
+                    # is on its way): keep the microphone closed.
+                    self.mic_mute.set_property("mute", True)
+                    self._status("[grant ignored: talk request already released]")
+                else:
+                    self.have_floor = True
+                    self.mic_mute.set_property("mute", False)
+                    # We are the source; the radio must not be transmitting.
+                    self.radio_unkey(immediate=True)
+                    self._status("[TALKING]")
+            elif self.floor_holder:
+                if self._beep_timers:
+                    self._end_beep()
+                self.mic_mute.set_property("mute", True)
+                if self.have_floor:
+                    self.have_floor = False
+                    self.talking = False
+                # Someone else is talking: their audio is arriving, send it to the radio.
+                self.radio_key()
+                marker = "[priority] " if msg.get("priority") else ""
+                self._status(f"[{marker}{name} is talking]")
+            else:
+                self.mic_mute.set_property("mute", True)
+                if self.have_floor:
+                    self.have_floor = False
+                    self.talking = False
+                # Roger beep: someone was talking and now nobody is. On a
+                # gateway it only makes sense while the radio is keyed (relaying
+                # a LAN speaker): that is the one case where it reaches radio
+                # listeners, and the key is held until it has finished.
+                beep_ms = 0
+                if self.roger_beep and previous_holder:
+                    if self.ptt is not None and not self.ptt.keyed:
+                        # Radio-originated transmission: nothing is being relayed to the radio.
+                        self._status("[roger beep skipped: the radio was not keyed]")
+                    else:
+                        beep_ms = self.play_roger_beep()
+                        if beep_ms:
+                            self._status("[roger beep]")
+                        else:
+                            self._status("[roger beep unavailable on this machine]")
+                # Hold the key for the whole beep plus the buffer delay (gateway only).
+                self.radio_unkey(extra_ms=beep_ms + (self.beep_lead_ms if beep_ms else 0))
+                self._status("[ready]")
+            # Note: `talking` is deliberately NOT cleared by a broadcast for
+            # someone else's floor when we never held it. A stale broadcast
+            # racing our own pending ptt-start would otherwise drop our intent
+            # and leave the mic open after release.
+
+        elif mtype == "floor-denied":
+            self.talking = False
+            self.mic_mute.set_property("mute", True)
+            self._status(f"[{safe_text(msg.get('name'))} is talking]")
+
+        elif mtype == "floor-preempted":
+            self.talking = False
+            self.have_floor = False
+            self.mic_mute.set_property("mute", True)
+            print(f"\n[interrupted by priority node {safe_text(msg.get('by'))}]", flush=True)
+
+    # ---------- PTT input (keyboard / VOX) ----------
+
+    async def start_talk(self):
+        if self.talking:
+            return
+        if self.my_id is None:
+            return  # no session yet: the server would ignore it and we would keep a false intent
+        self.talking = True
+        await self.send({"type": "ptt-start"})
+
+    async def stop_talk(self):
+        if not self.talking:
+            return
+        self.talking = False
+        self.mic_mute.set_property("mute", True)
+        await self.send({"type": "ptt-stop"})
+
+    async def toggle_talk(self):
+        if not self.talking:
+            await self.start_talk()
+        else:
+            await self.stop_talk()
+
+    def start_keyboard_thread(self, key_queue):
+        def reader():
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                while True:
+                    ch = sys.stdin.read(1)
+                    self.loop.call_soon_threadsafe(key_queue.put_nowait, ch)
+                    if ch == "q":
+                        break
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+
+    # ---------- TLS ----------
+
+    def make_ssl_context(self):
+        if not self.url.startswith("wss://"):
+            return None
+        if self.tls_mode == "insecure" or self.tls_mode == "pin":
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+        if self.tls_mode == "ca-file":
+            ctx = ssl.create_default_context(cafile=self.ca_file)
+            # Python 3.13+ turns on strict X.509 checks by default, which
+            # reject some self-signed leaf certificates. The certificate is
+            # still fully verified against the file we pin it to.
+            ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+            return ctx
+        return ssl.create_default_context()
+
+    def check_server_identity(self, ws):
+        """Returns True if this connection's server is authenticated."""
+        if not self.url.startswith("wss://"):
+            return False
+        if self.tls_mode in ("system", "ca-file"):
+            return True  # the TLS handshake already verified it
+        ssl_obj = ws.transport.get_extra_info("ssl_object") if getattr(ws, "transport", None) else None
+        if ssl_obj is None:
+            raise ConnectionError("could not read the server certificate")
+        fingerprint = sha256_pin(ssl_obj.getpeercert(binary_form=True))
+        if self.tls_mode == "pin":
+            if fingerprint != self.pin:
+                raise ConnectionError(
+                    f"server certificate does not match --pin-sha256 (got {fingerprint})"
+                )
+            return True
+        print(f"[tls] UNVERIFIED server certificate, sha256 {fingerprint}", file=sys.stderr)
+        return False
+
+    # ---------- main loop ----------
+
+    async def run(self):
+        self.loop = asyncio.get_running_loop()
+        self.build_pipeline()
+        if self.ptt:
+            self._control_pulse()
+            GLib.timeout_add_seconds(1, self._check_control_progress)
+
+        ssl_ctx = self.make_ssl_context()
+
+        import websockets
+
+        quit_event = asyncio.Event()
+
+        if self.ptt:
+            print(f"[ready — radio gateway on {self.ptt.port}, Ctrl+C to quit]")
+            if self.vox:
+                print(
+                    f"[software squelch {self.squelch.upper()}: threshold {self.vox.threshold_db:.0f} dBFS, "
+                    f"attack {self.vox.attack_ms} ms, hang {self.vox.hang_ms} ms, pre-roll {self.preroll_ms} ms]",
+                    flush=True,
+                )
+            else:
+                print("[software squelch: not used, radio audio is not forwarded (--no-vox)]", flush=True)
+        elif sys.stdin.isatty():
+            print("[ready — space to talk, q to quit]")
+            key_queue = asyncio.Queue()
+            self.start_keyboard_thread(key_queue)
+
+            async def keys():
+                while True:
+                    ch = await key_queue.get()
+                    if ch == " ":
+                        await self.toggle_talk()
+                    elif ch == "q":
+                        print("\nDisconnected.")
+                        quit_event.set()
+                        return
+
+            asyncio.create_task(keys())
+        else:
+            print("[ready — no TTY and no PTT interface given, this instance is listen-only]")
+
+        if self.token and self.url.startswith("ws://"):
+            print("[warning] plaintext ws:// — the priority token will not be sent", file=sys.stderr)
+
+        # Outages are a "when, not if" on a 24/7 unattended box — the
+        # signaling server rebooting, a power blip, or a flaky network link
+        # all just look like the connection dropping. Reconnect with backoff
+        # instead of exiting.
+        async def connection_loop():
+            backoff = 1
+            while True:
+                try:
+                    print(f"Connecting to {self.url} as {safe_text(self.name)!r}...")
+                    async with websockets.connect(self.url, ssl=ssl_ctx, max_size=MAX_SIGNALING_BYTES) as ws:
+                        self.verified = self.check_server_identity(ws)
+                        if self.token and not self.verified:
+                            print(
+                                "[tls] server not verified — joining WITHOUT the priority token. "
+                                "Use --ca-file or --pin-sha256 to authenticate the server.",
+                                file=sys.stderr,
+                            )
+                        self.ws = ws
+                        backoff = 1
+                        print("[connected]")
+                        await self._recv_loop()
+                except Exception as e:
+                    print(f"[connection error] {e}", file=sys.stderr)
+
+                self.ws = None
+                self.verified = False
+                self.reset_for_reconnect()
+                print(f"[disconnected — retrying in {backoff}s]", file=sys.stderr)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+
+        try:
+            conn_task = asyncio.create_task(connection_loop())
+            quit_task = asyncio.create_task(quit_event.wait())
+            done, pending = await asyncio.wait({conn_task, quit_task}, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            # connection_loop() only ever finishes by raising (it's an
+            # infinite retry loop) — surface that instead of swallowing it.
+            if conn_task in done:
+                conn_task.result()
+        finally:
+            self._control_seen = None  # shutting down: stop watching the loop
+            # Whatever ended the process, never leave the transmitter keyed.
+            if self.ptt:
+                self.ptt.close()
+            self.pipeline.set_state(Gst.State.NULL)
+
+    async def _recv_loop(self):
+        async for raw in self.ws:
+            try:
+                await self.handle_message(raw)
+            except Exception as e:
+                print(f"[error handling message] {safe_text(e, 200)}", file=sys.stderr)
+
+
+def read_token(args):
+    if args.token_file:
+        with open(args.token_file, "r", encoding="utf-8") as f:
+            return f.read().strip() or None
+    env = os.environ.get("LAN_WALKIE_TOKEN")
+    if env:
+        return env.strip() or None
+    if args.token:
+        print(
+            "[warning] --token is visible to other users in `ps` and shell history; "
+            "prefer --token-file or the LAN_WALKIE_TOKEN environment variable",
+            file=sys.stderr,
+        )
+        return args.token
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="LAN Walkie headless CLI client / AIOC radio gateway")
+    parser.add_argument("url", help="wss://<server>:8443")
+    parser.add_argument("--name", default="Headless", help="Name shown to other participants")
+    parser.add_argument(
+        "--source",
+        default="autoaudiosrc",
+        help="GStreamer source element, e.g. autoaudiosrc, alsasrc device=hw:1,0, "
+        "or 'audiotestsrc is-live=true wave=silence' for testing without a mic",
+    )
+    parser.add_argument(
+        "--sink",
+        default="autoaudiosink",
+        help="GStreamer sink element, e.g. autoaudiosink, alsasink device=hw:1,0, "
+        "or fakesink for testing without speakers",
+    )
+    parser.add_argument(
+        "--alsa-device",
+        default=None,
+        help="Shortcut that sets both --source and --sink to this ALSA device, e.g. "
+        "plughw:CARD=AIOC,DEV=0 (find the name with `arecord -l` / `aplay -l`).",
+    )
+    parser.add_argument(
+        "--rx-gain",
+        type=float,
+        default=0.0,
+        help="Boost (or cut) audio arriving from the LAN, in dB, e.g. 6. Look at the '[rx level]' "
+        "log lines first: raise it only for quiet talkers, and stop when a loud talker's peak "
+        "reaches 0 dBFS, because it hard-clips there. Limited to +20 dB.",
+    )
+    parser.add_argument(
+        "--stun",
+        default="stun://stun.l.google.com:19302",
+        help="STUN server, or empty string to disable (pure-LAN/Tailscale setups usually don't need it; "
+        "note the STUN server sees this machine's public IP)",
+    )
+
+    parser.add_argument("--upnp", action="store_true",
+                        help="Enable automatic router port mappings (off by default; unnecessary on LAN/Tailscale)")
+
+    tls = parser.add_argument_group("TLS (wss:// is verified against the system CAs by default)")
+    tls.add_argument("--ca-file", default=None, help="PEM file to trust, e.g. the server's own certs/cert.pem")
+    tls.add_argument(
+        "--pin-sha256",
+        default=None,
+        help="Expected SHA-256 fingerprint of the server certificate "
+        "(openssl x509 -in cert.pem -noout -fingerprint -sha256)",
+    )
+    tls.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Skip certificate verification (the priority token is then never sent)",
+    )
+
+    radio = parser.add_argument_group("AIOC radio gateway")
+    radio.add_argument(
+        "--aioc",
+        action="store_true",
+        help=f"Auto-detect the AIOC's serial port (USB {AIOC_USB_VID:04x}:{AIOC_USB_PID:04x}) and run as a radio gateway",
+    )
+    radio.add_argument(
+        "--ptt-serial",
+        default=None,
+        help="Serial port that keys the radio via DTR/RTS (e.g. /dev/ttyACM0). Implies gateway mode.",
+    )
+    radio.add_argument("--ptt-tail-ms", type=int, default=300, help="Keep the radio keyed this long after the floor frees")
+    radio.add_argument(
+        "--beep-lead-ms",
+        type=int,
+        default=400,
+        help="Roger beep: keep the radio keyed this long beyond the beep itself, so it is not cut off "
+        "by audio buffering (raise it if the beep is clipped)",
+    )
+    radio.add_argument("--max-ptt-seconds", type=int, default=90, help="Hard local limit on one keyed period")
+    radio.add_argument(
+        "--no-vox",
+        action="store_true",
+        help="Only send LAN audio to the radio; do not forward what the radio receives to the LAN",
+    )
+    radio.add_argument(
+        "--squelch",
+        default=os.environ.get("LAN_WALKIE_SQUELCH", "on"),
+        help="Software squelch (the gate that decides when radio audio goes to the LAN): 'on' (default) keeps "
+        "today's gate; 'off' uses almost no gate and lets the radio's own squelch filter (threshold "
+        f"{SQUELCH_PRESETS['off']['threshold_db']:.0f} dBFS, no attack delay, {SQUELCH_PRESETS['off']['preroll_ms']} ms "
+        "pre-roll). Also read from LAN_WALKIE_SQUELCH.",
+    )
+    radio.add_argument(
+        "--vox-threshold-db",
+        type=float,
+        default=None,
+        help="Radio input level (dBFS RMS) that counts as received audio (default -40 with squelch on, "
+        "-55 with squelch off). The radio's squelch must be closed below this.",
+    )
+    radio.add_argument(
+        "--vox-debug",
+        action="store_true",
+        help="Print the radio input level once a second (use it to choose --vox-threshold-db)",
+    )
+    radio.add_argument("--vox-attack-ms", type=int, default=None, help="default 60 (squelch on) / 20 (off)")
+    radio.add_argument("--vox-hang-ms", type=int, default=None, help="default 1500")
+    radio.add_argument(
+        "--preroll-ms",
+        type=int,
+        default=None,
+        help="Delay the audio sent to the LAN by this long so the start of a transmission is not clipped "
+        "(default 0 with squelch on, 300 with squelch off)",
+    )
+
+    parser.add_argument(
+        "--token-file",
+        default=None,
+        help="File containing the server's PRIORITY_TOKEN (also read from LAN_WALKIE_TOKEN). "
+        "Priority lets this client interrupt whoever's talking.",
+    )
+    parser.add_argument("--token", default=None, help=argparse.SUPPRESS)  # deprecated: visible in `ps`
+    args = parser.parse_args()
+
+    if not -40 <= args.rx_gain <= 20:
+        parser.error("--rx-gain must be between -40 and +20 dB (GStreamer's volume element tops out at 10x)")
+    if args.insecure and (args.ca_file or args.pin_sha256):
+        parser.error("--insecure cannot be combined with --ca-file or --pin-sha256")
+    pin = None
+    if args.pin_sha256:
+        pin = normalize_pin(args.pin_sha256)
+        if len(pin) != 64:
+            parser.error("--pin-sha256 must be a 64-hex-digit SHA-256 fingerprint")
+    if args.insecure:
+        tls_mode = "insecure"
+    elif pin:
+        tls_mode = "pin"
+    elif args.ca_file:
+        tls_mode = "ca-file"
+    else:
+        tls_mode = "system"
+
+    source, sink = args.source, args.sink
+    if args.alsa_device:
+        source = f"alsasrc device={args.alsa_device}"
+        sink = f"alsasink device={args.alsa_device}"
+
+    try:
+        gate = squelch_settings(
+            args.squelch, args.vox_threshold_db, args.vox_attack_ms, args.vox_hang_ms, args.preroll_ms
+        )
+    except ValueError as e:
+        parser.error(f"--squelch / LAN_WALKIE_SQUELCH: {e}")
+    squelch_mode = args.squelch.strip().lower()
+
+    ptt = None
+    vox = None
+    port = args.ptt_serial
+    if args.aioc and not port:
+        port = find_aioc_port()
+        if not port:
+            parser.error(
+                f"no AIOC found (USB {AIOC_USB_VID:04x}:{AIOC_USB_PID:04x}); "
+                "check `lsusb`, or pass --ptt-serial /dev/ttyACM0 explicitly"
+            )
+    if port:
+        ptt = AiocPtt(port)  # opens the port and forces it to the idle (unkeyed) state
+        if not args.no_vox:
+            vox = Vox(gate["threshold_db"], gate["attack_ms"], gate["hang_ms"])
+
+    client = WalkieClient(
+        url=args.url,
+        name=args.name,
+        source=source,
+        sink=sink,
+        stun=args.stun or None,
+        tls_mode=tls_mode,
+        ca_file=args.ca_file,
+        pin=pin,
+        token=read_token(args),
+        ptt=ptt,
+        vox=vox,
+        ptt_tail_ms=args.ptt_tail_ms,
+        max_ptt_seconds=args.max_ptt_seconds,
+        vox_debug=args.vox_debug,
+        upnp=args.upnp,
+        beep_lead_ms=args.beep_lead_ms,
+        preroll_ms=gate["preroll_ms"],
+        squelch=squelch_mode,
+        rx_gain_db=args.rx_gain,
+    )
+
+    try:
+        asyncio.run(client.run())
+    except (KeyboardInterrupt, SystemExit):
+        print("\nDisconnected.")
+    finally:
+        if ptt:
+            ptt.close()  # idempotent; covers startup failures before run()
+
+
+if __name__ == "__main__":
+    main()

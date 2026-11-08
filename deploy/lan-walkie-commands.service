@@ -1,0 +1,24 @@
+# Phone remote commands (restart / reboot / status). One per machine.
+# Replace @USER@, @REPO@ and @ROLE@ (gateway on the gateway machine, server on the server machine).
+# Setup: docs/ALERTS.md ("Remote commands").
+#
+# NoNewPrivileges is deliberately NOT set: the gateway role uses a narrow sudo rule
+# (restart the gateway service, reboot) that needs it off.
+[Unit]
+Description=LAN Walkie phone remote commands (@ROLE@)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=@USER@
+SupplementaryGroups=systemd-journal
+EnvironmentFile=/etc/lan-walkie-alert.env
+Environment=COMMAND_ROLE=@ROLE@
+ExecStart=/usr/bin/python3 -u @REPO@/tools/remote_commands.py
+Restart=always
+RestartSec=10
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
