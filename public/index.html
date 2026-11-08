@@ -2,33 +2,60 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
 <title>LAN Walkie</title>
 <link rel="stylesheet" href="style.css" />
 <link rel="manifest" href="manifest.webmanifest" />
+<meta name="theme-color" content="#f1f3f0" media="(prefers-color-scheme: light)" />
 <meta name="theme-color" content="#080c12" />
 <link rel="icon" href="icon-192.png" />
 <link rel="apple-touch-icon" href="icon-192.png" />
 </head>
 <body>
+<main class="console">
+  <header class="masthead">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>LAN WALKIE</span></div>
+    <span class="product-label">PUSH TO TALK</span>
+  </header>
 
-<div id="setup" class="screen">
-  <h1>LAN Walkie</h1>
-  <p>Pick a name so others know who's talking.</p>
-  <input id="name-input" type="text" placeholder="Your name" maxlength="24" autocomplete="off" />
-  <button id="join-btn">Join channel</button>
-</div>
+  <section id="setup" class="screen setup-screen" aria-labelledby="setup-title">
+    <div class="intro">
+      <p class="eyebrow">A direct line.</p>
+      <h1 id="setup-title">Less typing.<br />More talking.</h1>
+      <p class="intro-copy" id="name-help">Pick a name so everyone knows<br class="wide-break" /> who's on the other end.</p>
+    </div>
+    <div class="join-card">
+      <label for="name-input">Your name</label>
+      <input id="name-input" type="text" placeholder="How should we call you?" maxlength="24" autocomplete="off" aria-describedby="name-help" />
+      <button id="join-btn" type="button">Join channel <span aria-hidden="true">↗</span></button>
+      <p class="permission-note">Allow microphone access when asked.</p>
+    </div>
+    <p class="setup-footnote">Hold to talk. Release to listen.</p>
+  </section>
 
-<div id="talk" class="screen hidden">
-  <div id="status">Connecting…</div>
-  <button id="ptt">HOLD TO TALK</button>
-  <p id="beep-hint" class="hint hidden">🔔 Tap anywhere once to turn on the roger beep sound</p>
-  <p class="hint">Hold the button (or hold Space) to talk. Release to listen.</p>
-  <p class="hint you-line">You're <strong id="my-name-label"></strong> — <a href="#" id="change-name">not you?</a></p>
-  <h2>On the channel</h2>
-  <ul id="peer-list"><li class="empty">No one else here yet</li></ul>
-</div>
-
+  <section id="talk" class="screen talk-screen hidden" aria-label="Radio channel">
+    <div class="status-panel">
+      <span class="eyebrow">CHANNEL STATUS</span>
+      <div id="status" role="status" aria-live="polite" aria-atomic="true">Connecting…</div>
+    </div>
+    <div class="transmit-panel">
+      <div class="dial">
+        <button id="ptt" type="button" aria-describedby="talk-help" aria-live="polite" aria-atomic="true">HOLD TO TALK</button>
+      </div>
+      <p id="talk-help" class="talk-help">Hold to talk <span aria-hidden="true">/</span> Release to listen<span class="keyboard-help">Or hold <kbd>Space</kbd> on your keyboard</span></p>
+      <div class="beep-slot"><p id="beep-hint" class="hidden" role="status">Tap anywhere once to enable the roger beep.</p></div>
+    </div>
+    <div class="identity">
+      <p>You're <strong id="my-name-label"></strong></p>
+      <a href="#" id="change-name">Not you?</a>
+    </div>
+    <section class="roster" aria-labelledby="roster-title">
+      <div class="roster-heading"><h2 id="roster-title">On the channel</h2><span aria-hidden="true" class="roster-decoration">•••</span></div>
+      <ul id="peer-list" tabindex="0" aria-label="People on the channel"><li class="empty">No one else here yet</li></ul>
+    </section>
+  </section>
+  <footer class="console-footer" aria-hidden="true"><span>LAN / VOICE</span><span class="speaker-grille"></span></footer>
+</main>
 <script src="app.js"></script>
 </body>
 </html>
