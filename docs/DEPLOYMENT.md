@@ -30,7 +30,8 @@ a default, so you can set them in Portainer's *Environment variables* section
 This keeps `PRIORITY_TOKEN` out of git. Variables: `CERT_HOSTNAMES`,
 `CERT_IPS`, `MAX_TRANSMIT_MS`, `MAX_CLIENTS`, `PRIORITY_TOKEN`,
 `ALLOWED_ORIGINS`, `ROGER_BEEP`, `LOG_LEVEL`, `LOG_FORMAT`, `LOG_STATS_MS`,
-`STATS`, `EVENT_RETENTION_DAYS`, `BIND_ADDR`. What gets logged is described in
+`STATS`, `EVENT_RETENTION_DAYS`, `ADMIN_TOKEN`, `CONVERSATION_GAP_S`,
+`BIND_ADDR`. What gets logged is described in
 `LOGGING.md`.
 
 ### Usage database

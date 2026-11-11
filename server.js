@@ -12,6 +12,7 @@ const WebSocket = require('ws');
 const { execFileSync } = require('child_process');
 const { createLogger, createThrottle, createKeyedThrottle } = require('./lib/logger');
 const { createStore } = require('./lib/store');
+const { createAdminRouter } = require('./lib/admin');
 
 // LOG_LEVEL: debug | info (default) | warn | error.  LOG_FORMAT: text (default) | json.
 // LOG_STATS_MS: how often to write a one-line summary; 0 turns it off (default 5 minutes).
@@ -104,6 +105,23 @@ if (PRIORITY_TOKEN && (PRIORITY_TOKEN.length < MIN_TOKEN_LENGTH || PLACEHOLDER_T
   PRIORITY_TOKEN = null;
 }
 const PRIORITY_DIGEST = PRIORITY_TOKEN ? sha256(PRIORITY_TOKEN) : null;
+
+// Admin page (public/admin.html) and its read-only API (lib/admin.js).
+// ADMIN_TOKEN unset: open to whoever can reach the server. Set: every API
+// request needs it. A token that is set but unusable closes the API rather
+// than silently leaving it open.
+let ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
+let ADMIN_DISABLED = null;
+if (ADMIN_TOKEN && (ADMIN_TOKEN.length < MIN_TOKEN_LENGTH || PLACEHOLDER_TOKENS.has(ADMIN_TOKEN.toLowerCase()))) {
+  log.error('admin-disabled', {
+    reason: `ADMIN_TOKEN is a placeholder or shorter than ${MIN_TOKEN_LENGTH} characters`,
+    fix: 'generate one with: openssl rand -hex 24 (or unset it to leave the admin page open)',
+  });
+  ADMIN_TOKEN = null;
+  ADMIN_DISABLED = 'bad-token';
+}
+// Transmissions closer together than this belong to one conversation.
+const CONVERSATION_GAP_S = Math.max(1, Number(process.env.CONVERSATION_GAP_S) || 60);
 
 function sha256(s) {
   return crypto.createHash('sha256').update(s).digest();
@@ -202,6 +220,10 @@ app.use((req, res, next) => {
   if (!FRAME_ANCESTORS.length) res.set('X-Frame-Options', 'DENY');
   next();
 });
+app.use('/api/admin', createAdminRouter({
+  store, log, token: ADMIN_TOKEN, disabledReason: ADMIN_DISABLED, conversationGapS: CONVERSATION_GAP_S,
+  throttle: createKeyedThrottle(10000),
+}));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const server = https.createServer(
@@ -616,8 +638,14 @@ server.listen(PORT, '0.0.0.0', () => {
     log_format: log.format,
     stats_ms: LOG_STATS_MS,
     stats_db: store.enabled ? 'on' : store.reason,
+    admin: ADMIN_DISABLED ? 'disabled' : ADMIN_TOKEN ? 'token' : 'open',
+    conversation_gap_s: CONVERSATION_GAP_S,
     event_retention_days: EVENT_RETENTION_DAYS,
   });
+  // Said out loud once per start, so an open admin page is a choice, not an accident.
+  if (store.enabled && !ADMIN_TOKEN && !ADMIN_DISABLED) {
+    log.warn('admin-open', { note: 'usage statistics at /admin.html are readable by anyone who can reach this server; set ADMIN_TOKEN to require a token' });
+  }
   store.event('server-start', null, { version: require('./package.json').version, node: process.version });
   if (store.enabled) {
     // Purge old raw events and write the daily backup. Checked hourly; the

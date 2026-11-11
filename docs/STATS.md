@@ -105,8 +105,44 @@ WHERE d.kind = 'phone'
 GROUP BY day, leave_reason ORDER BY day DESC;
 ```
 
+## Usage page
+
+`https://<server>:8443/admin.html` shows one day at a time (the day runs from
+midnight to midnight in the browser's timezone):
+
+- totals: minutes talked, transmissions, longest transmission, busiest hour,
+  connections and drops;
+- minutes talked per day for the last 30 days (click a bar to open that day);
+- radio calls nobody could hear;
+- conversations: transmissions less than `CONVERSATION_GAP_S` (60) seconds
+  apart, with who took part and for how long;
+- a timeline of connections per device, with dropped ones marked;
+- totals per device, and every transmission;
+- CSV export of the day's transmissions and connections.
+
+The page only reads. It gets its data from three endpoints:
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/admin/range?from=<ms>&to=<ms>` | Transmissions that started in the range, sessions connected during it, conversations, per-device totals, overall totals. At most 400 days and 20000 rows of each. |
+| `GET /api/admin/devices` | Every device ever seen, with all-time totals. |
+| `GET /api/admin/export.csv?table=transmissions\|sessions&from=<ms>&to=<ms>` | The same rows as CSV. Text that a spreadsheet would treat as a formula gets a leading `'`. |
+
+### Access
+
+| `ADMIN_TOKEN` | Result |
+|---|---|
+| unset | Open to anyone who can reach the server. The server logs `admin-open` at start. |
+| 16 or more characters | Every API request needs `Authorization: Bearer <token>`. The page asks for it once and keeps it until the tab is closed. It is never put in a URL and never logged. |
+| shorter, or a placeholder | The API answers 403 to everyone and the server logs `admin-disabled`. |
+
+Generate one with `openssl rand -hex 24`. The page's own files (`admin.html`,
+`admin.js`, `admin.css`) are always served; they contain no data.
+
 ## What is stored about people
 
 Names, IP addresses, user agents and the times they connected and talked. The
 priority token is never stored. Anyone who can read the data directory can read
-all of it; there is no page or API that serves it.
+all of it, and so can anyone who can open the usage page: it shows names and
+times, and the CSV export includes IP addresses and user agents. Set
+`ADMIN_TOKEN` if not everyone on the network should see that.

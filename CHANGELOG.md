@@ -21,6 +21,11 @@
   Docker volume `lan-walkie-data`. A database failure is logged and never affects the channel.
   Each transmission records how many listeners could actually hear it, so radio calls that
   reached nobody can be counted.
+- Usage page at `/admin.html` with a read-only API under `/api/admin/` (`docs/STATS.md`): day
+  totals, minutes talked per day for 30 days, radio calls nobody could hear, conversations,
+  a connections timeline with drops marked, per-device totals, every transmission, and CSV
+  export. Open by default (the server logs `admin-open`); set `ADMIN_TOKEN` to require a
+  token. New setting `CONVERSATION_GAP_S` (60).
 - Protocol (all optional, older clients and servers keep working): `join.device` and
   `join.role`, a new `presence` message from the browser, and `tx` (transmission id) in `floor`.
   The gateway now identifies itself with `role: "gateway"`.

@@ -86,6 +86,17 @@ The log lines above did not change. Three lines are about the database itself:
 
 The `config` line says `stats_db="on"`, `"off"` or `"open-failed"`.
 
+The usage page (`/admin.html`) adds these:
+
+| Event | Level | Meaning |
+|---|---|---|
+| `admin-open` | warn | Written once at start when no `ADMIN_TOKEN` is set: the usage page is readable by anyone who can reach the server. |
+| `admin-denied` | warn | A request to the usage API had no token or a wrong one. `reason` is `no-token` or `wrong-token`; the token itself is never written. Limited per IP. |
+| `admin-disabled` | error | `ADMIN_TOKEN` is too short or a placeholder. The usage API answers 403 until it is fixed or unset. |
+| `admin-error` | error | A query for the usage page failed. |
+
+The `config` line says `admin="open"`, `"token"` or `"disabled"`.
+
 ## Fields
 
 When lines were dropped by a rate limit, the next line that does get written

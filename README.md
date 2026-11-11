@@ -30,6 +30,9 @@ USB cable.
 - **Headless client** for machines with no browser (runs under systemd).
 - **Radio gateway.** LAN speech keys a handheld radio and received radio audio
   goes back to the LAN.
+- **Usage page** at `/admin.html`: minutes talked per day, who talked and for
+  how long, connections and drops, conversations, and radio calls nobody could
+  hear.
 - **Operations tools:** structured logs, phone alerts through
   [ntfy](https://ntfy.sh) when the radio path breaks, and restart-from-your-phone
   commands protected by a one-time code.
@@ -149,6 +152,8 @@ Everything is an optional environment variable on the server.
 | `STATS` | `on` | Usage database (who talked, when, how long, who could hear it). `off` disables it. See [docs/STATS.md](docs/STATS.md) |
 | `DATA_DIR` | `data/` | Where the usage database and its backups are kept |
 | `EVENT_RETENTION_DAYS` | `400` | Days of raw events to keep in the usage database |
+| `ADMIN_TOKEN` | unset | Token (16+ characters) required by the usage page's API. Unset leaves the page open to anyone who can reach the server |
+| `CONVERSATION_GAP_S` | `60` | Transmissions closer together than this many seconds count as one conversation on the usage page |
 
 Generate a priority token with `openssl rand -hex 24`. Short or placeholder
 values are refused: the server logs an error and runs with priority disabled.

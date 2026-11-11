@@ -35,6 +35,11 @@ services:
       # events to keep. Sessions and transmissions are kept without limit.
       - STATS=${STATS:-on}
       - EVENT_RETENTION_DAYS=${EVENT_RETENTION_DAYS:-400}
+      # Usage page at /admin.html. Empty = open to anyone who can reach the
+      # server. Set a token (openssl rand -hex 24) to require it.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      # Transmissions closer together than this (seconds) are one conversation.
+      - CONVERSATION_GAP_S=${CONVERSATION_GAP_S:-60}
       # Generate with: openssl rand -hex 24  (16+ chars; unset = priority off)
       - PRIORITY_TOKEN=${PRIORITY_TOKEN:-}
       # Comma-separated browser origins allowed to open the WebSocket.

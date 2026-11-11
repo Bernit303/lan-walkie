@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex" />
+<title>LAN Walkie usage</title>
+<link rel="stylesheet" href="admin.css" />
+<meta name="theme-color" content="#f1f3f0" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#080c12" />
+<link rel="icon" type="image/svg+xml" sizes="any" href="favicon.svg?v=2" />
+</head>
+<body>
+<main class="page">
+  <header class="masthead">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>LAN WALKIE</span><span class="product-label">USAGE</span></div>
+    <a class="back-link" href="./">Open the walkie</a>
+  </header>
+
+  <form id="token-form" class="notice hidden" autocomplete="off">
+    <label for="token-input">This page needs the admin token.</label>
+    <div class="token-row">
+      <input id="token-input" type="password" autocomplete="off" spellcheck="false" />
+      <button type="submit">Unlock</button>
+    </div>
+    <p class="hint">It is kept only until this tab is closed.</p>
+  </form>
+  <p id="message" class="notice hidden" role="status"></p>
+
+  <section class="toolbar" aria-label="Day">
+    <button id="prev-day" type="button" aria-label="Previous day">‹</button>
+    <input id="day" type="date" aria-label="Day" />
+    <button id="next-day" type="button" aria-label="Next day">›</button>
+    <button id="today" type="button">Today</button>
+    <button id="refresh" type="button">Refresh</button>
+    <span id="updated" class="hint" role="status"></span>
+  </section>
+
+  <div id="content" class="hidden">
+    <section aria-labelledby="totals-title">
+      <h2 id="totals-title">Totals for <span id="day-label"></span></h2>
+      <dl id="tiles" class="tiles"></dl>
+    </section>
+
+    <section aria-labelledby="daily-title">
+      <h2 id="daily-title">Minutes talked per day, last 30 days</h2>
+      <div class="chart-scroll"><svg id="daily-chart" class="chart" role="img" aria-labelledby="daily-title"></svg></div>
+      <p id="daily-readout" class="readout" role="status">Point at a bar, or click it to open that day.</p>
+    </section>
+
+    <section aria-labelledby="unheard-title">
+      <h2 id="unheard-title">Radio calls nobody could hear</h2>
+      <p id="unheard-summary" class="hint"></p>
+      <div class="table-scroll"><table id="unheard-table"></table></div>
+    </section>
+
+    <section aria-labelledby="conversations-title">
+      <h2 id="conversations-title">Conversations</h2>
+      <p id="conversations-summary" class="hint"></p>
+      <div class="table-scroll"><table id="conversations-table"></table></div>
+    </section>
+
+    <section aria-labelledby="timeline-title">
+      <h2 id="timeline-title">Connections</h2>
+      <p class="legend">
+        <span class="key"><span class="swatch swatch-session" aria-hidden="true"></span>Connected</span>
+        <span class="key"><span class="swatch swatch-drop" aria-hidden="true"></span>Ended as a dropped connection</span>
+        <span class="key"><span class="swatch swatch-talk" aria-hidden="true"></span>Talking</span>
+      </p>
+      <div class="chart-scroll"><svg id="timeline" class="chart" role="img" aria-labelledby="timeline-title"></svg></div>
+      <p id="timeline-readout" class="readout" role="status">Point at a bar for details.</p>
+    </section>
+
+    <section aria-labelledby="devices-title">
+      <h2 id="devices-title">By device</h2>
+      <div class="table-scroll"><table id="devices-table"></table></div>
+    </section>
+
+    <section aria-labelledby="talk-title">
+      <h2 id="talk-title">Every transmission</h2>
+      <div class="table-scroll"><table id="talk-table"></table></div>
+    </section>
+
+    <section aria-labelledby="export-title">
+      <h2 id="export-title">Export this day</h2>
+      <p class="export-row">
+        <button id="export-transmissions" type="button">Transmissions (CSV)</button>
+        <button id="export-sessions" type="button">Connections (CSV)</button>
+      </p>
+    </section>
+  </div>
+</main>
+<script src="admin.js"></script>
+</body>
+</html>
