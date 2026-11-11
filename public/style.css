@@ -215,3 +215,21 @@ h2 { font-size: 12px; margin: 0; font-weight: 650; color: var(--muted); }
 @media (prefers-contrast: more) and (prefers-color-scheme: light) { :root { --line: #42564b; --muted: #243c30; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } #join-btn:active { transform: none; } }
 @media (forced-colors: active) { .brand-mark, .dial, .status-panel, .join-card, #ptt, #peer-list li { border: 1px solid ButtonText; } #ptt.active { outline: 5px double Highlight; } #status::before { background: CanvasText; } }
+
+/* Layout fix: the talk screen scrolls instead of squeezing the people list to nothing. */
+.talk-screen { overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.talk-screen > * { flex-shrink: 0; }
+.roster { flex: none; min-height: 0; }
+#peer-list { flex: none; min-height: 96px; max-height: 260px; }
+.admin-link { display: inline-block; margin-top: 12px; padding: 8px 0; color: var(--muted); font-size: 12px; text-underline-offset: 4px; }
+.admin-link:hover { color: var(--accent); }
+@media (min-width: 820px) and (min-height: 600px) {
+  .console { width: min(100%, 880px); height: min(100%, 760px); }
+  .talk-screen { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto auto minmax(0, 1fr); column-gap: 32px; overflow: hidden; }
+  .talk-screen > * { flex-shrink: initial; }
+  .status-panel { grid-column: 2; grid-row: 1; }
+  .transmit-panel { grid-column: 1; grid-row: 1 / 4; align-self: center; }
+  .identity { grid-column: 2; grid-row: 2; margin-top: 12px; }
+  .roster { grid-column: 2; grid-row: 3; min-height: 0; overflow-y: auto; }
+  #peer-list { max-height: none; flex: 1 1 auto; }
+}
