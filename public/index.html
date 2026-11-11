@@ -36,7 +36,6 @@
 
   <section id="talk" class="screen talk-screen hidden" aria-label="Radio channel">
     <div class="status-panel">
-      <span class="eyebrow">CHANNEL STATUS</span>
       <div id="status" role="status" aria-live="polite" aria-atomic="true">Connecting…</div>
     </div>
     <div class="transmit-panel">
@@ -53,24 +52,30 @@
     <section class="roster" aria-labelledby="roster-title">
       <div class="roster-heading"><h2 id="roster-title">On the channel</h2><span aria-hidden="true" class="roster-decoration">•••</span></div>
       <ul id="peer-list" tabindex="0" aria-label="People on the channel"><li class="empty">No one else here yet</li></ul>
-      <div class="wake-row">
-        <label for="wake-mode">Keep screen on</label>
-        <select id="wake-mode">
-          <option value="always">Always while open</option>
-          <option value="active">During conversations</option>
-          <option value="off">Off</option>
-        </select>
-        <p id="wake-status" role="status"></p>
-      </div>
-      <div id="bg-audio-row" class="wake-row hidden">
-        <label for="bg-audio">Play audio in the background</label>
-        <input id="bg-audio" type="checkbox" />
-      </div>
-      <a class="admin-link" href="admin.html">Usage stats</a>
     </section>
   </section>
-  <footer class="console-footer" aria-hidden="true"><span>LAN / VOICE</span><span class="speaker-grille"></span></footer>
+  <div id="settings-panel" class="settings-panel hidden" role="dialog" aria-label="Settings">
+    <div class="settings-head"><h2>Settings</h2><button id="settings-close" type="button" aria-label="Close settings">✕</button></div>
+        <div class="wake-row">
+          <label for="wake-mode">Keep screen on</label>
+          <select id="wake-mode">
+            <option value="always">Always while open</option>
+            <option value="active">During conversations</option>
+            <option value="off">Off</option>
+          </select>
+          <p id="wake-status" role="status"></p>
+        </div>
+        <div id="bg-audio-row" class="wake-row hidden">
+          <label for="bg-audio">Play audio in the background</label>
+          <input id="bg-audio" type="checkbox" />
+        </div>
+  </div>
+  <footer class="console-footer">
+    <button id="settings-btn" class="footer-btn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings-panel"><span aria-hidden="true">⚙</span> Settings</button>
+    <a id="stats-link" class="footer-btn" href="admin.html"><span aria-hidden="true">▮▮▮</span> Stats</a>
+  </footer>
 </main>
 <script src="app.js"></script>
+<script src="panel.js"></script>
 </body>
 </html>

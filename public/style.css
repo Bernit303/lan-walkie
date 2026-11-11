@@ -216,20 +216,33 @@ h2 { font-size: 12px; margin: 0; font-weight: 650; color: var(--muted); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } #join-btn:active { transform: none; } }
 @media (forced-colors: active) { .brand-mark, .dial, .status-panel, .join-card, #ptt, #peer-list li { border: 1px solid ButtonText; } #ptt.active { outline: 5px double Highlight; } #status::before { background: CanvasText; } }
 
-/* Layout fix: the talk screen scrolls instead of squeezing the people list to nothing. */
-.talk-screen { overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
-.talk-screen > * { flex-shrink: 0; }
-.roster { flex: none; min-height: 0; }
-#peer-list { flex: none; min-height: 96px; max-height: 260px; }
-.admin-link { display: inline-block; margin-top: 12px; padding: 8px 0; color: var(--muted); font-size: 12px; text-underline-offset: 4px; }
-.admin-link:hover { color: var(--accent); }
+/* Layout: nothing scrolls except the people list. */
+.console { position: relative; }
+.talk-screen { overflow: hidden; }
+.status-panel { min-height: 0; padding: 8px 14px; border-radius: 12px; }
+#status { margin: 0; height: auto; max-height: 40px; }
+.transmit-panel { padding-top: clamp(8px, 2dvh, 20px); }
+.talk-help { margin-top: 10px; }
+.beep-slot { min-height: 0; padding: 2px 0; }
+.roster { flex: 1; min-height: 120px; padding-top: 10px; }
+#peer-list { flex: 1; min-height: 0; max-height: none; overflow-y: auto; }
+@media (min-height: 441px) {
+  #ptt { width: clamp(132px, 27dvh, 260px); height: clamp(132px, 27dvh, 260px); padding: 16px; }
+}
+.console-footer { display: flex; gap: 10px; margin-top: 10px; font-size: 11px; }
+.footer-btn { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 12px; color: var(--muted); background: var(--raised); border: 1px solid var(--line); border-radius: 10px; font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; text-decoration: none; }
+.footer-btn:hover, .footer-btn[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
+.settings-panel { position: absolute; left: 12px; right: 12px; bottom: 76px; z-index: 5; padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 12px 40px var(--shadow); }
+.settings-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.settings-head h2 { font-size: 13px; color: var(--text); }
+#settings-close { width: 44px; height: 44px; margin: -8px -10px -8px 0; color: var(--muted); background: transparent; border: 0; font-size: 16px; }
+.settings-panel .wake-row:first-of-type { margin-top: 0; border-top: 0; }
 @media (min-width: 820px) and (min-height: 600px) {
   .console { width: min(100%, 880px); height: min(100%, 760px); }
-  .talk-screen { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto auto minmax(0, 1fr); column-gap: 32px; overflow: hidden; }
-  .talk-screen > * { flex-shrink: initial; }
+  .talk-screen { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto auto minmax(0, 1fr); column-gap: 32px; }
   .status-panel { grid-column: 2; grid-row: 1; }
   .transmit-panel { grid-column: 1; grid-row: 1 / 4; align-self: center; }
   .identity { grid-column: 2; grid-row: 2; margin-top: 12px; }
-  .roster { grid-column: 2; grid-row: 3; min-height: 0; overflow-y: auto; }
-  #peer-list { max-height: none; flex: 1 1 auto; }
+  .roster { grid-column: 2; grid-row: 3; min-height: 0; }
+  .settings-panel { left: auto; width: 360px; }
 }
