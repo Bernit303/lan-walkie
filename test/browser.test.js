@@ -24,7 +24,39 @@ function anyStub() {
   });
 }
 
-async function loadPage() {
+// A fake navigator.wakeLock that counts requests and hands out locks the test can inspect.
+function fakeWakeLock() {
+  const api = {
+    requests: 0,
+    locks: [],
+    refuse: false,
+    async request(kind) {
+      api.requests += 1;
+      if (api.refuse) throw new Error('NotAllowedError');
+      const lock = {
+        kind,
+        released: false,
+        handlers: [],
+        addEventListener(type, fn) { if (type === 'release') lock.handlers.push(fn); },
+        async release() { lock.fire(); },
+        // Also what the browser does by itself when the page is hidden.
+        fire() {
+          if (lock.released) return;
+          lock.released = true;
+          for (const fn of lock.handlers) fn();
+        },
+      };
+      api.locks.push(lock);
+      return lock;
+    },
+    held: () => api.locks.filter((l) => !l.released).length,
+  };
+  return api;
+}
+
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+async function loadPage({ wakeLock, storage = {} } = {}) {
   const timers = [];
   let clock = 0;
   const sockets = [];
@@ -74,11 +106,34 @@ async function loadPage() {
   const track = { enabled: true, readyState: 'live', kind: 'audio', addEventListener() {}, stop() {} };
   const stream = { getAudioTracks: () => [track], getTracks: () => [track] };
 
+  // The document: visibility is controllable, everything else is a harmless stub.
+  const doc = { hidden: false, listeners: {} };
+  const documentStub = new Proxy({}, {
+    get: (_t, key) => {
+      if (key === 'hidden') return doc.hidden;
+      if (key === 'addEventListener') return (type, fn) => { (doc.listeners[type] = doc.listeners[type] || []).push(fn); };
+      return anyStub();
+    },
+  });
+  const setHidden = (hidden) => {
+    doc.hidden = hidden;
+    // The browser takes the wake lock away when the page is hidden.
+    if (hidden && wakeLock) for (const lock of wakeLock.locks) lock.fire();
+    for (const fn of doc.listeners.visibilitychange || []) fn();
+  };
+
+  const navigatorStub = { mediaDevices: { getUserMedia: async () => stream } };
+  if (wakeLock) navigatorStub.wakeLock = wakeLock;
+
   const context = vm.createContext({
-    document: anyStub(),
+    document: documentStub,
     window: anyStub(),
-    navigator: { mediaDevices: { getUserMedia: async () => stream } },
-    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    navigator: navigatorStub,
+    localStorage: {
+      getItem: (key) => (key in storage ? storage[key] : null),
+      setItem(key, value) { storage[key] = String(value); },
+      removeItem(key) { delete storage[key]; },
+    },
     location: { host: 'test.local', reload() {} },
     WebSocket: FakeSocket,
     RTCPeerConnection: FakeConnection,
@@ -104,7 +159,11 @@ async function loadPage() {
   };
   await run("join('Test')");
   const sock = sockets[sockets.length - 1];
-  return { run, sock, sockets, connections, advance };
+  const open = async () => {
+    for (const fn of sock.handlers.open || []) fn();
+    await settle();
+  };
+  return { run, sock, sockets, connections, advance, setHidden, open, storage };
 }
 
 test('one failed connection is retried on its own; healthy connections and the session stay up', async () => {
@@ -157,4 +216,121 @@ test('simultaneous offers: the lower id wins, nobody is left with a broken conne
   assert.equal(stale.closed, true, 'our losing offer should have been dropped');
   const answered = page2.sock.sent.filter((m) => m.type === 'answer');
   assert.equal(answered.length, 1, 'we should have answered their offer');
+});
+
+// --- Screen wake lock ---
+
+test('wake lock: taken once the socket opens, not before, and never requested twice', async () => {
+  const wakeLock = fakeWakeLock();
+  const page = await loadPage({ wakeLock });
+  assert.equal(wakeLock.requests, 0, 'no lock before the session is up');
+  await page.open();
+  assert.equal(wakeLock.requests, 1);
+  assert.equal(wakeLock.locks[0].kind, 'screen');
+  assert.equal(wakeLock.held(), 1);
+
+  // More reasons to want the lock while it is already held (or still being asked for).
+  page.run('updateWakeLock(); updateWakeLock(); noteActivity()');
+  await settle();
+  assert.equal(wakeLock.requests, 1, 'a second request was made while one lock is held');
+});
+
+test('wake lock: asked for again when the page comes back to the foreground', async () => {
+  const wakeLock = fakeWakeLock();
+  const page = await loadPage({ wakeLock });
+  await page.open();
+  page.setHidden(true);
+  await settle();
+  assert.equal(wakeLock.held(), 0);
+  assert.equal(wakeLock.requests, 1, 'must not ask while hidden');
+  page.setHidden(false);
+  await settle();
+  assert.equal(wakeLock.requests, 2);
+  assert.equal(wakeLock.held(), 1);
+});
+
+test('wake lock: re-acquired if the browser releases it while the page is visible', async () => {
+  const wakeLock = fakeWakeLock();
+  const page = await loadPage({ wakeLock });
+  await page.open();
+  wakeLock.locks[0].fire();
+  await settle();
+  assert.equal(wakeLock.held(), 1);
+});
+
+test('wake lock: "during conversations" releases 10 minutes after the last activity', async () => {
+  const wakeLock = fakeWakeLock();
+  const page = await loadPage({ wakeLock, storage: { 'walkie-wake': 'active' } });
+  await page.open();
+  await page.sock.deliver({ type: 'welcome', id: 'mmm' });
+  assert.equal(wakeLock.held(), 1);
+
+  page.advance(9 * 60 * 1000);
+  await page.sock.deliver({ type: 'floor', holder: 'aaa', name: 'Radio' }); // activity restarts the window
+  page.advance(30 * 60 * 1000);
+  assert.equal(wakeLock.held(), 1, 'released while someone was still talking');
+
+  await page.sock.deliver({ type: 'floor', holder: null });
+  page.advance(9 * 60 * 1000);
+  assert.equal(wakeLock.held(), 1, 'released before the idle window ended');
+  page.advance(2 * 60 * 1000);
+  assert.equal(wakeLock.held(), 0, 'still held after 10 idle minutes');
+
+  // New activity takes it again.
+  await page.sock.deliver({ type: 'floor', holder: 'aaa', name: 'Radio' });
+  await settle();
+  assert.equal(wakeLock.held(), 1);
+});
+
+test('wake lock: "always" keeps it through idle time and through a reconnect', async () => {
+  const wakeLock = fakeWakeLock();
+  const page = await loadPage({ wakeLock });
+  await page.open();
+  page.advance(60 * 60 * 1000);
+  assert.equal(wakeLock.held(), 1);
+  page.run('scheduleReconnect()');
+  await settle();
+  assert.equal(wakeLock.held(), 1, 'the screen must stay on while reconnecting');
+});
+
+test('wake lock: "off" never asks; changing the mode applies at once and is remembered', async () => {
+  const wakeLock = fakeWakeLock();
+  const page = await loadPage({ wakeLock, storage: { 'walkie-wake': 'off' } });
+  await page.open();
+  assert.equal(wakeLock.requests, 0);
+
+  page.run("setWakeMode('always')");
+  await settle();
+  assert.equal(wakeLock.held(), 1);
+  assert.equal(page.storage['walkie-wake'], 'always');
+
+  page.run("setWakeMode('off')");
+  await settle();
+  assert.equal(wakeLock.held(), 0);
+  page.run("setWakeMode('nonsense')");
+  assert.equal(page.storage['walkie-wake'], 'off', 'an unknown mode must be ignored');
+});
+
+test('wake lock: a refused request is not retried in a loop, only on the next activity', async () => {
+  const wakeLock = fakeWakeLock();
+  wakeLock.refuse = true;
+  const page = await loadPage({ wakeLock });
+  await page.open();
+  await settle();
+  assert.equal(wakeLock.requests, 1);
+  wakeLock.refuse = false;
+  page.run('noteActivity()');
+  await settle();
+  assert.equal(wakeLock.held(), 1);
+});
+
+test('wake lock: a browser without the API still works', async () => {
+  const page = await loadPage();
+  await page.open();
+  await page.sock.deliver({ type: 'welcome', id: 'mmm' });
+  await page.sock.deliver({ type: 'floor', holder: 'aaa', name: 'Radio' });
+  page.setHidden(true);
+  page.setHidden(false);
+  page.run("setWakeMode('active'); noteActivity()");
+  assert.deepEqual(page.sock.sent[0], { type: 'join', name: 'Test' });
 });

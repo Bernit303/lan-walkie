@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+- Browser: the app keeps the phone screen on (Screen Wake Lock API). A screen that locks hides
+  the page, which mutes received audio and gets the phone dropped as `dead-connection`; this
+  was how most phone sessions ended. A "Keep screen on" selector on the talk screen offers
+  "Always while open" (default), "During conversations" (while someone talks and for 10 minutes
+  after the last floor change, own talk or touch) and "Off". The choice is remembered per
+  device. No server or protocol change.
+
 ### Fixed
 - Radio gateway going deaf: twice in one day (2026-11-05 evening and 2026-11-06) the gateway
   stayed connected but stopped receiving from the radio (`0 level readings`, `-inf dBFS` in the

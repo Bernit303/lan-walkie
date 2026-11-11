@@ -64,6 +64,30 @@ Browsers only allow microphone access over HTTPS (or `localhost`), which is why
 the server is HTTPS-only. To skip the certificate warning, put it behind
 [Tailscale Serve](docs/DEPLOYMENT.md#trusted-https-with-tailscale-serve).
 
+### On a phone
+
+The page only works while it is on screen: when the phone locks, received audio
+is muted and the server drops the phone a few seconds later. To avoid that, the
+app keeps the screen on while it is open. The "Keep screen on" selector under
+the channel list has three choices:
+
+- **Always while open** (default). Best for a phone on a charger.
+- **During conversations.** On while someone talks and for 10 minutes after the
+  last activity, then the phone may sleep.
+- **Off.**
+
+Limits:
+
+- It only stops the automatic screen timeout. The power button, switching to
+  another app and incoming calls still hide the page.
+- Android Chrome supports it. iPhones need a recent iOS; a browser without
+  support shows a hint, and the fix there is a longer screen timeout in the
+  phone's settings.
+- Battery saver modes can refuse it. The app says so and asks again on the next
+  touch.
+- Inside an iframe (for example a Home Assistant dashboard) the frame needs
+  `allow="screen-wake-lock"`.
+
 ## Ways to talk
 
 | Client | How |

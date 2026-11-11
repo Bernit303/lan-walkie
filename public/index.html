@@ -53,6 +53,15 @@
     <section class="roster" aria-labelledby="roster-title">
       <div class="roster-heading"><h2 id="roster-title">On the channel</h2><span aria-hidden="true" class="roster-decoration">•••</span></div>
       <ul id="peer-list" tabindex="0" aria-label="People on the channel"><li class="empty">No one else here yet</li></ul>
+      <div class="wake-row">
+        <label for="wake-mode">Keep screen on</label>
+        <select id="wake-mode">
+          <option value="always">Always while open</option>
+          <option value="active">During conversations</option>
+          <option value="off">Off</option>
+        </select>
+        <p id="wake-status" role="status"></p>
+      </div>
     </section>
   </section>
   <footer class="console-footer" aria-hidden="true"><span>LAN / VOICE</span><span class="speaker-grille"></span></footer>

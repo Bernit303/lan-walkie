@@ -124,6 +124,114 @@ changeNameLink.addEventListener('click', (e) => {
   location.reload();
 });
 
+// Screen wake lock. A locked screen hides the page: received audio is muted
+// and the page stops answering the server, which then drops the phone as a
+// dead connection. The lock only stops the automatic screen timeout while the
+// app is in the foreground; the browser takes it away whenever the page is
+// hidden, so it is asked for again each time the page comes back.
+//
+// Modes: 'always' (while the app is open), 'active' (while someone talks and
+// for WAKE_IDLE_MS after the last floor change, own PTT or touch), 'off'.
+const WAKE_KEY = 'walkie-wake';
+const WAKE_MODES = ['always', 'active', 'off'];
+const WAKE_DEFAULT = 'always';
+const WAKE_IDLE_MS = 10 * 60 * 1000;
+const wakeSelect = document.getElementById('wake-mode');
+const wakeStatusEl = document.getElementById('wake-status');
+const wakeSupported = !!(navigator.wakeLock && typeof navigator.wakeLock.request === 'function');
+let wakeMode = WAKE_DEFAULT;
+let wakeLock = null; // the lock we hold, if any
+let wakePending = false; // a request is in flight: never start a second one
+let wakeFailed = false; // the last request was refused (battery saver, iframe without permission)
+let wakeSession = false; // set once the first socket opens; kept across automatic reconnects
+let wakeIdleTimer = null;
+let lastActivityAt = 0;
+
+try {
+  const saved = localStorage.getItem(WAKE_KEY);
+  if (WAKE_MODES.includes(saved)) wakeMode = saved;
+} catch {}
+wakeSelect.value = wakeMode;
+wakeSelect.disabled = !wakeSupported;
+wakeSelect.addEventListener('change', () => setWakeMode(wakeSelect.value));
+
+function setWakeMode(mode) {
+  if (!WAKE_MODES.includes(mode)) return;
+  wakeMode = mode;
+  try { localStorage.setItem(WAKE_KEY, mode); } catch {}
+  lastActivityAt = Date.now();
+  updateWakeLock();
+}
+
+function wakeWanted() {
+  if (!wakeSupported || !wakeSession || document.hidden || wakeMode === 'off') return false;
+  if (wakeMode === 'always') return true;
+  return !!floorHolder || Date.now() - lastActivityAt < WAKE_IDLE_MS;
+}
+
+function renderWakeStatus() {
+  let text;
+  if (!wakeSupported) text = "This browser can't keep the screen on. Set a longer screen timeout on the phone.";
+  else if (wakeLock) text = 'Screen stays on';
+  else if (wakeMode === 'off' || !wakeSession) text = '';
+  else if (wakeFailed) text = "Couldn't keep the screen on (battery saver?)";
+  else if (wakeMode === 'active' && !wakeWanted()) text = 'Idle: screen may turn off';
+  else text = '';
+  wakeStatusEl.textContent = text;
+}
+
+// Brings the lock in line with what the mode wants right now. Safe to call
+// from anywhere, any number of times.
+function updateWakeLock() {
+  clearTimeout(wakeIdleTimer);
+  wakeIdleTimer = null;
+  const want = wakeWanted();
+  if (want && wakeMode === 'active' && !floorHolder) {
+    wakeIdleTimer = setTimeout(updateWakeLock, lastActivityAt + WAKE_IDLE_MS - Date.now());
+  }
+  if (want) {
+    if (!wakeLock && !wakePending) requestWakeLock();
+  } else if (wakeLock) {
+    const lock = wakeLock;
+    wakeLock = null;
+    try { Promise.resolve(lock.release()).catch(() => {}); } catch {}
+  }
+  renderWakeStatus();
+}
+
+async function requestWakeLock() {
+  wakePending = true;
+  let lock = null;
+  try {
+    lock = await navigator.wakeLock.request('screen');
+  } catch {}
+  wakePending = false;
+  wakeFailed = !lock;
+  if (!lock) {
+    // Not retried here (a refusal would loop); the next touch, floor change
+    // or return to the foreground asks again.
+    renderWakeStatus();
+    return;
+  }
+  // The browser releases the lock by itself when the page is hidden.
+  lock.addEventListener('release', () => {
+    if (wakeLock !== lock) return;
+    wakeLock = null;
+    updateWakeLock();
+  });
+  wakeLock = lock;
+  updateWakeLock(); // the mode or visibility may have changed while waiting
+}
+
+function noteActivity() {
+  lastActivityAt = Date.now();
+  if (wakeSession) updateWakeLock();
+}
+for (const evt of ['pointerdown', 'keydown']) {
+  window.addEventListener(evt, noteActivity, { passive: true });
+}
+renderWakeStatus();
+
 let joining = false;
 let rosterIds = new Set(); // peers the server currently lists
 const retryCounts = new Map(); // peer id -> how many times we re-offered to a peer that never called us back
@@ -211,6 +319,11 @@ function connect() {
     statusEl.textContent = 'Connected';
     pttBtn.disabled = false;
     backoff = 1000;
+    if (!wakeSession) {
+      wakeSession = true;
+      lastActivityAt = Date.now();
+    }
+    updateWakeLock();
   });
   sock.addEventListener('close', () => {
     if (sock === ws) scheduleReconnect();
@@ -285,6 +398,7 @@ function connect() {
     if (msg.type === 'floor') {
       const previousHolder = floorHolder;
       floorHolder = msg.holder;
+      noteActivity();
       if (floorHolder === myId) {
         if (!wantTalk) {
           // The button was released before the grant arrived. Give the
@@ -313,6 +427,7 @@ function connect() {
     }
 
     if (msg.type === 'floor-denied') {
+      noteActivity();
       setPttLabel(`${msg.name} IS TALKING`);
       return;
     }
@@ -394,6 +509,9 @@ function resetForReconnect() {
   if (audioTrack) audioTrack.enabled = false;
   pttBtn.classList.remove('active');
   setPttLabel('HOLD TO TALK');
+  // The wake lock is deliberately kept: letting the screen lock during a
+  // reconnect would hide the page and stop the reconnect from working.
+  updateWakeLock();
 }
 
 // The priority marker is always a separate element, never a prefix inside
@@ -555,6 +673,7 @@ document.addEventListener('visibilitychange', () => {
   // Foreground only: received audio is muted (not torn down, so no tap is
   // needed to resume) while hidden.
   for (const el of audioEls.values()) el.muted = document.hidden;
+  updateWakeLock(); // the browser dropped the lock when the page was hidden: ask again
 });
 
 window.addEventListener('keydown', (e) => { if (e.code === 'Space' && !e.repeat) startTalk(); });
