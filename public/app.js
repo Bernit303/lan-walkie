@@ -255,12 +255,19 @@ function setBgAudio(on) {
   bgAudio = !!on;
   try { localStorage.setItem(BG_AUDIO_KEY, bgAudio ? 'on' : 'off'); } catch {}
   applyReceiveMute();
+  sendPresence();
 }
 
 const receiveMuted = () => document.hidden && !bgAudio;
 
 function applyReceiveMute() {
   for (const el of audioEls.values()) el.muted = receiveMuted();
+}
+
+// Tells the server whether this page is on screen and whether it is playing
+// received audio, so the usage records can say if anyone could hear a call.
+function sendPresence() {
+  wsSend({ type: 'presence', visible: !document.hidden, audible: !receiveMuted() });
 }
 
 // A call that arrives while the page is hidden is shown in the tab title and,
@@ -286,6 +293,22 @@ function updateCallNotice() {
     const fn = show ? navigator.setAppBadge : navigator.clearAppBadge;
     if (typeof fn === 'function') Promise.resolve(fn.call(navigator)).catch(() => {});
   } catch {}
+}
+
+// One id per browser profile, so the usage records can tell devices apart
+// even when two people pick the same name. Random, never derived from anything.
+const DEVICE_KEY = 'walkie-device';
+function deviceId() {
+  try {
+    let id = localStorage.getItem(DEVICE_KEY);
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(id || '')) {
+      id = crypto.randomUUID();
+      localStorage.setItem(DEVICE_KEY, id);
+    }
+    return id;
+  } catch {
+    return undefined; // the server derives one
+  }
 }
 
 let joining = false;
@@ -402,7 +425,8 @@ function connect() {
       myId = msg.id;
       rogerBeep = msg.rogerBeep === true;
       updateBeepHint();
-      wsSend({ type: 'join', name: myName });
+      wsSend({ type: 'join', name: myName, device: deviceId(), role: 'browser' });
+      sendPresence();
       return;
     }
 
@@ -734,6 +758,7 @@ document.addEventListener('visibilitychange', () => {
   // while hidden, except on a desktop with background audio on.
   applyReceiveMute();
   updateCallNotice();
+  sendPresence();
   updateWakeLock(); // the browser dropped the lock when the page was hidden: ask again
 });
 

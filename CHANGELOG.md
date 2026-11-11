@@ -14,6 +14,16 @@
 - Browser: a call that arrives while the page is hidden shows in the tab title
   ("● Radio talking", then "● Radio called" until the page is looked at) and as a badge on the
   installed app's icon where supported.
+- Server: usage database (`docs/STATS.md`). Every connection, transmission, refused talk
+  request and presence change is recorded in SQLite (`node:sqlite`, no new dependency), with a
+  raw event log, a daily backup (7 kept) and a purge of raw events after
+  `EVENT_RETENTION_DAYS` (400). New settings `STATS`, `DATA_DIR`, `EVENT_RETENTION_DAYS`; new
+  Docker volume `lan-walkie-data`. A database failure is logged and never affects the channel.
+  Each transmission records how many listeners could actually hear it, so radio calls that
+  reached nobody can be counted.
+- Protocol (all optional, older clients and servers keep working): `join.device` and
+  `join.role`, a new `presence` message from the browser, and `tx` (transmission id) in `floor`.
+  The gateway now identifies itself with `role: "gateway"`.
 
 ### Fixed
 - Radio gateway going deaf: twice in one day (2026-11-05 evening and 2026-11-06) the gateway

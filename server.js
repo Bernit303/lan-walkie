@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const WebSocket = require('ws');
 const { execFileSync } = require('child_process');
 const { createLogger, createThrottle, createKeyedThrottle } = require('./lib/logger');
+const { createStore } = require('./lib/store');
 
 // LOG_LEVEL: debug | info (default) | warn | error.  LOG_FORMAT: text (default) | json.
 // LOG_STATS_MS: how often to write a one-line summary; 0 turns it off (default 5 minutes).
@@ -37,9 +38,21 @@ process.on('unhandledRejection', (err) => logFatal('unhandled-rejection', err in
 for (const signal of ['SIGTERM', 'SIGINT']) {
   process.on(signal, () => {
     log.info('shutdown', { signal });
+    store.event('server-stop', null, { signal });
+    store.close();
     process.exit(0);
   });
 }
+
+// Usage database (lib/store.js): sessions, transmissions and a raw event log in
+// SQLite. STATS=off turns it off. It can never affect the channel: if it cannot
+// be opened or a write fails, the server logs it and carries on without it.
+const isOff = (value) => ['0', 'false', 'off', 'no'].includes(String(value || '').trim().toLowerCase());
+const STATS = !isOff(process.env.STATS);
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const EVENT_RETENTION_DAYS = Math.max(1, Number(process.env.EVENT_RETENTION_DAYS) || 400);
+const store = createStore({ enabled: STATS, dir: DATA_DIR, log, retentionDays: EVENT_RETENTION_DAYS });
+const MAINTENANCE_MS = 60 * 60 * 1000;
 
 const PORT = Number(process.env.PORT) || 8443;
 const CERT_DIR = path.join(__dirname, 'certs');
@@ -156,6 +169,21 @@ function cleanName(value) {
   return cleaned || 'Anon';
 }
 
+// Optional fields of `join`, used only for the usage records.
+const DEVICE_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const ROLES = ['browser', 'cli', 'gateway'];
+// A client that sends no (or a bad) device id still gets a stable one, as long
+// as its name and user agent stay the same.
+function deviceIdFor(value, name, ua) {
+  if (typeof value === 'string' && DEVICE_RE.test(value)) return value;
+  return 'auto-' + sha256(`${name}|${ua || ''}`).toString('hex').slice(0, 16);
+}
+// Older clients send no role: a browser always sends an Origin header, the CLI never does.
+function roleFor(value, origin) {
+  if (ROLES.includes(value)) return value;
+  return origin ? 'browser' : 'cli';
+}
+
 ensureCert();
 
 const app = express();
@@ -213,6 +241,30 @@ const clients = new Map(); // id -> { ws, name, priority, joined }
 let floorHolder = null; // id of whoever currently has permission to transmit
 let floorTimer = null;
 let floorSince = 0;
+let floorTx = null; // id of the current transmission, sent in `floor` and used as its database key
+
+// Sortable by time, unique, and safe as a file name (recordings will use it).
+const newTxId = () => 't' + Date.now().toString(36) + crypto.randomBytes(3).toString('hex');
+
+// Who is there to hear a transmission: every joined client but the speaker,
+// and of those the ones a person can actually hear it on (not a gateway, and
+// playing audio, which a phone with a locked screen is not).
+function listenerCounts(holderId) {
+  let all = 0;
+  let audible = 0;
+  for (const [cid, c] of clients) {
+    if (!c.joined || cid === holderId) continue;
+    all += 1;
+    if (c.role !== 'gateway' && c.audible) audible += 1;
+  }
+  return { all, audible };
+}
+
+function endTransmission(reason, holderId, preemptedBy) {
+  if (!floorTx) return;
+  store.txEnd({ tx: floorTx, reason, preemptedBy, listenersAudible: listenerCounts(holderId).audible });
+  floorTx = null;
+}
 
 // A client that stops reading must not make the server buffer for it without
 // limit (inbound is capped per message and per second, outbound was not).
@@ -241,15 +293,24 @@ function broadcastFloor() {
   const holder = floorHolder ? clients.get(floorHolder) : null;
   for (const [, c] of clients) {
     if (!c.joined) continue;
-    send(c.ws, { type: 'floor', holder: floorHolder, name: holder?.name || null, priority: !!holder?.priority });
+    send(c.ws, { type: 'floor', holder: floorHolder, name: holder?.name || null, priority: !!holder?.priority, tx: floorTx });
   }
 }
 
 function grantFloor(id) {
+  const tx = newTxId();
+  if (floorHolder !== null) endTransmission('preempted', floorHolder, tx); // taken over by a priority speaker
   floorHolder = id;
   floorSince = Date.now();
+  floorTx = tx;
   const holder = clients.get(id);
   log.info('floor-granted', { id: shortId(id), name: holder?.name, priority: !!holder?.priority });
+  const heard = listenerCounts(id);
+  store.txStart({
+    tx, connId: id, name: holder?.name, role: holder?.role, priority: !!holder?.priority,
+    listeners: heard.all, listenersAudible: heard.audible, ts: floorSince,
+  });
+  store.event('floor-granted', id, { tx, name: holder?.name, priority: !!holder?.priority, listeners: heard.all, listeners_audible: heard.audible }, floorSince);
   broadcastFloor();
   clearTimeout(floorTimer);
   // Safety net: a frozen tab, a dead battery, or a crashed CLI client should
@@ -257,6 +318,8 @@ function grantFloor(id) {
   floorTimer = setTimeout(() => {
     if (floorHolder === id) {
       log.warn('floor-timeout', { id: shortId(id), name: clients.get(id)?.name, held_ms: Date.now() - floorSince, limit_ms: MAX_TRANSMIT_MS });
+      store.event('floor-timeout', id, { tx: floorTx, held_ms: Date.now() - floorSince });
+      endTransmission('timeout', id);
       floorHolder = null;
       broadcastFloor();
     }
@@ -267,6 +330,8 @@ function grantFloor(id) {
 function releaseFloorIfHeldBy(id, reason, who) {
   if (floorHolder === id) {
     log.info('floor-released', { id: shortId(id), name: (who || clients.get(id))?.name, reason, held_ms: Date.now() - floorSince });
+    store.event('floor-released', id, { tx: floorTx, reason, held_ms: Date.now() - floorSince });
+    endTransmission(reason, id);
     floorHolder = null;
     clearTimeout(floorTimer);
     broadcastFloor();
@@ -299,6 +364,8 @@ wss.on('connection', (ws, req) => {
   const me = {
     ws, name: 'Anon', priority: false, joined: false, alive: true, appPing: false, lastMsg: Date.now(),
     connectedAt: Date.now(), endReason: null, ip: remoteIp(req), relayWindowStart: 0, relayBytes: 0,
+    // For the usage records. A client is taken as on screen and audible until it says otherwise.
+    device: null, role: null, visible: true, audible: true,
     // Per-connection limits on log lines a misbehaving client could repeat; freed with the connection.
     frameThrottle: createThrottle(5000), deniedThrottle: createThrottle(1000), errorThrottle: createThrottle(1000),
   };
@@ -306,6 +373,8 @@ wss.on('connection', (ws, req) => {
   log.info('connect', {
     id: shortId(id), ip: me.ip, origin: req.headers.origin, ua: req.headers['user-agent'], clients: clients.size,
   });
+  store.sessionStart({ connId: id, ip: me.ip, ua: req.headers['user-agent'], origin: req.headers.origin, ts: me.connectedAt });
+  store.event('connect', id, { ip: me.ip, origin: req.headers.origin, ua: req.headers['user-agent'], clients: clients.size }, me.connectedAt);
 
   // Without a listener, an 'error' event (invalid UTF-8, oversize frame,
   // reset) is thrown by EventEmitter and takes the whole process down.
@@ -342,19 +411,37 @@ wss.on('connection', (ws, req) => {
           log.warn('priority-denied', { id: shortId(id), name: me.name, reason: PRIORITY_DIGEST ? 'wrong-token' : 'priority-disabled-on-server', suppressed }));
       }
       log.info('join', { id: shortId(id), name: me.name, priority: me.priority, again, clients: joinedCount() });
+      me.device = deviceIdFor(msg.device, me.name, req.headers['user-agent']);
+      me.role = roleFor(msg.role, req.headers.origin);
+      store.sessionJoin({ connId: id, deviceId: me.device, name: me.name, role: me.role, ua: req.headers['user-agent'] });
+      store.event('join', id, { name: me.name, device: me.device, role: me.role, priority: me.priority, again, clients: joinedCount() });
       broadcastPeerList();
       // A late joiner (e.g. the gateway reconnecting) must learn who is talking
       // now; otherwise it stays unaware until the next floor change. Sent only
       // while the floor is held, and without re-granting or re-arming the timer.
       if (floorHolder !== null) {
         const holder = clients.get(floorHolder);
-        send(ws, { type: 'floor', holder: floorHolder, name: holder?.name || null, priority: !!holder?.priority });
+        send(ws, { type: 'floor', holder: floorHolder, name: holder?.name || null, priority: !!holder?.priority, tx: floorTx });
       }
       return;
     }
 
     if (!me.joined) {
       log.debug('ignored-before-join', { id: shortId(id), type: msg.type });
+      return;
+    }
+
+    // Whether the page is on screen and playing received audio. Only changes
+    // are recorded. `audible` is optional and defaults to `visible`.
+    if (msg.type === 'presence') {
+      if (typeof msg.visible !== 'boolean') return;
+      const audible = typeof msg.audible === 'boolean' ? msg.audible : msg.visible;
+      if (msg.visible === me.visible && audible === me.audible) return;
+      me.visible = msg.visible;
+      me.audible = audible;
+      log.debug('presence', { id: shortId(id), name: me.name, visible: me.visible, audible: me.audible });
+      store.presence({ connId: id, visible: me.visible, audible: me.audible });
+      store.event('presence', id, { visible: me.visible, audible: me.audible });
       return;
     }
 
@@ -412,12 +499,18 @@ wss.on('connection', (ws, req) => {
         grantFloor(id);
       } else if (me.priority && !holder?.priority) {
         log.info('floor-preempted', { by_id: shortId(id), by: me.name, from_id: shortId(floorHolder), from: holder?.name });
+        store.event('floor-preempted', id, { tx: floorTx, by: me.name, from_conn: floorHolder, from: holder?.name });
         if (holder) send(holder.ws, { type: 'floor-preempted', by: me.name });
         grantFloor(id);
       } else {
         send(ws, { type: 'floor-denied', holder: floorHolder, name: holder?.name });
-        me.deniedThrottle((suppressed) =>
-          log.info('floor-denied', { id: shortId(id), name: me.name, holder_id: shortId(floorHolder), holder: holder?.name, suppressed }));
+        // Recorded at the same limited rate as the log line, so a client that
+        // hammers the button cannot fill the database.
+        me.deniedThrottle((suppressed) => {
+          log.info('floor-denied', { id: shortId(id), name: me.name, holder_id: shortId(floorHolder), holder: holder?.name, suppressed });
+          store.denied({ connId: id, holderTx: floorTx });
+          store.event('floor-denied', id, { name: me.name, holder_tx: floorTx, holder: holder?.name, suppressed });
+        });
       }
       return;
     }
@@ -481,6 +574,8 @@ wss.on('connection', (ws, req) => {
       id: shortId(id), name: me.joined ? me.name : undefined, joined: me.joined,
       reason: me.endReason || 'closed', code, duration_s: Math.round((Date.now() - me.connectedAt) / 1000), clients: clients.size,
     });
+    store.sessionEnd({ connId: id, reason: me.endReason || 'closed', code });
+    store.event('leave', id, { name: me.joined ? me.name : undefined, joined: me.joined, reason: me.endReason || 'closed', code, clients: clients.size });
   });
 });
 
@@ -493,6 +588,7 @@ const heartbeat = setInterval(() => {
     if (stale) {
       c.endReason = 'dead-connection';
       log.warn('dead-connection', { id: shortId(id), name: c.joined ? c.name : undefined, check: c.appPing ? 'app-ping' : 'protocol-ping', silent_s: Math.round((now - c.lastMsg) / 1000) });
+      store.event('dead-connection', id, { name: c.joined ? c.name : undefined, check: c.appPing ? 'app-ping' : 'protocol-ping', silent_s: Math.round((now - c.lastMsg) / 1000) });
       c.ws.terminate();
       continue;
     }
@@ -519,7 +615,20 @@ server.listen(PORT, '0.0.0.0', () => {
     log_level: log.level,
     log_format: log.format,
     stats_ms: LOG_STATS_MS,
+    stats_db: store.enabled ? 'on' : store.reason,
+    event_retention_days: EVENT_RETENTION_DAYS,
   });
+  store.event('server-start', null, { version: require('./package.json').version, node: process.version });
+  if (store.enabled) {
+    // Purge old raw events and write the daily backup. Checked hourly; the
+    // backup itself only happens when today's file does not exist yet.
+    const maintain = () => {
+      const done = store.maintain();
+      if (done && (done.purged || done.backup || done.removed)) log.info('store-maintenance', done);
+    };
+    maintain();
+    setInterval(maintain, MAINTENANCE_MS).unref();
+  }
   log.info('listening', { url: `https://${lanIp}:${PORT}` });
   if (LOG_STATS_MS > 0) {
     const stats = setInterval(() => {

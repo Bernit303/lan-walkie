@@ -342,7 +342,7 @@ test('wake lock: a browser without the API still works', async () => {
   assert.equal(page.sock.sent[0].type, 'join');
 });
 
-// --- Background audio and call notice ---
+// --- Background audio, call notice, presence, device id ---
 
 // Joins, adds the peer 'aaa' and makes its audio arrive.
 async function withIncomingAudio(options) {
@@ -405,4 +405,32 @@ test('my own transmission is never announced as a call', async () => {
   await page.sock.deliver({ type: 'floor', holder: 'mmm', name: 'Test' });
   page.setHidden(true);
   assert.equal(page.doc.title, 'LAN Walkie');
+});
+
+test('join carries a stable device id and the browser role', async () => {
+  const page = await loadPage();
+  await page.sock.deliver({ type: 'welcome', id: 'mmm' });
+  const join = page.sock.sent.find((m) => m.type === 'join');
+  assert.deepEqual(join, { type: 'join', name: 'Test', device: '0f8fad5b-d9cb-469f-a165-70867728950e', role: 'browser' });
+  assert.equal(page.storage['walkie-device'], join.device);
+
+  // Next visit on the same browser: same id.
+  const again = await loadPage({ storage: { 'walkie-device': 'kept-from-before' } });
+  await again.sock.deliver({ type: 'welcome', id: 'nnn' });
+  assert.equal(again.sock.sent.find((m) => m.type === 'join').device, 'kept-from-before');
+});
+
+test('presence is sent after joining and on every visibility change', async () => {
+  const page = await loadPage({ userAgent: 'Mozilla/5.0 (Linux; Android 14) Mobile' });
+  await page.sock.deliver({ type: 'welcome', id: 'mmm' });
+  const presence = () => page.sock.sent.filter((m) => m.type === 'presence');
+  assert.deepEqual(presence(), [{ type: 'presence', visible: true, audible: true }]);
+  page.setHidden(true);
+  assert.deepEqual(presence()[1], { type: 'presence', visible: false, audible: false });
+
+  // A desktop tab with background audio is hidden but still audible.
+  const desktop = await loadPage();
+  await desktop.sock.deliver({ type: 'welcome', id: 'mmm' });
+  desktop.setHidden(true);
+  assert.deepEqual(desktop.sock.sent.filter((m) => m.type === 'presence')[1], { type: 'presence', visible: false, audible: true });
 });

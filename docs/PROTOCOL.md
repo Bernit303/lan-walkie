@@ -34,7 +34,7 @@ beep is generated locally; nothing is added to the audio streams.
 Client's first message, right after `welcome`.
 
 ```json
-{ "type": "join", "name": "Alice", "token": null }
+{ "type": "join", "name": "Alice", "token": null, "device": "0f8fad5b-d9cb-469f-a165-70867728950e", "role": "browser" }
 ```
 
 - `name` — display name. Must be a string (anything else becomes `"Anon"`).
@@ -48,7 +48,32 @@ Client's first message, right after `welcome`.
   field; the CLI sends `null` unless a token was supplied *and* the server's
   TLS identity was verified.
 
+- `device` — optional string, a stable id for this device, used only for the
+  usage records (`docs/STATS.md`). Must match `^[A-Za-z0-9_-]{8,64}$`. The
+  browser keeps a random one in its storage; the CLI derives one from the host
+  name and `--name`. Missing or invalid: the server derives one from the name
+  and user agent (`auto-...`).
+- `role` — optional: `browser`, `cli` or `gateway`. The gateway says
+  `gateway`, so "could a person hear this" never depends on its name. Missing
+  or invalid: `browser` if the connection has an `Origin` header, else `cli`.
+
+Neither field changes what a client may do. Older clients that send neither
+keep working.
+
 Triggers a `peers` broadcast to every joined client.
+
+### `presence` (client → server)
+
+```json
+{ "type": "presence", "visible": false, "audible": false }
+```
+
+Sent by the browser after `join` and whenever the page is hidden or shown.
+`visible` is whether the page is on screen; `audible` is whether it is playing
+received audio (a hidden desktop tab with background audio is not visible but
+audible). `audible` is optional and defaults to `visible`. A non-boolean
+`visible` is ignored. A client that never sends this is taken as visible and
+audible. The server only records it; nothing is sent to other clients.
 
 **Limits and ordering.** Until `join`, a connection receives no broadcasts
 and its `offer`/`answer`/`ice`/`ptt-*` messages are ignored. Messages over
@@ -158,8 +183,13 @@ Sent to every connected client whenever the floor holder changes —
 granted, released, preempted, or auto-released by timeout.
 
 ```json
-{ "type": "floor", "holder": "lt7qe9dv", "name": "Alice", "priority": false }
+{ "type": "floor", "holder": "lt7qe9dv", "name": "Alice", "priority": false, "tx": "tmhrz3k1a9f3c2e" }
 ```
+
+`tx` is the id of this transmission: new for every grant, the same for every
+client, `null` when the channel is free, and safe to use as a file name. It is
+the key of the transmission in the usage records. Clients that do not need it
+ignore it; an older server does not send it.
 
 `holder` is `null` when the channel is free. Every client's job on
 receiving this:

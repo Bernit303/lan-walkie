@@ -30,7 +30,15 @@ a default, so you can set them in Portainer's *Environment variables* section
 This keeps `PRIORITY_TOKEN` out of git. Variables: `CERT_HOSTNAMES`,
 `CERT_IPS`, `MAX_TRANSMIT_MS`, `MAX_CLIENTS`, `PRIORITY_TOKEN`,
 `ALLOWED_ORIGINS`, `ROGER_BEEP`, `LOG_LEVEL`, `LOG_FORMAT`, `LOG_STATS_MS`,
-`BIND_ADDR`. What gets logged is described in `LOGGING.md`.
+`STATS`, `EVENT_RETENTION_DAYS`, `BIND_ADDR`. What gets logged is described in
+`LOGGING.md`.
+
+### Usage database
+
+The server keeps a SQLite database of who talked and when in the
+`lan-walkie-data` volume (`/app/data`). Docker creates the volume on the first
+start with the right owner. It survives image updates; rolling back to an older
+image leaves it untouched. Details and example queries are in `STATS.md`.
 
 ### Certificate names
 

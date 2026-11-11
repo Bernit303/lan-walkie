@@ -36,6 +36,7 @@ import json
 import math
 import os
 import re
+import socket
 import ssl
 import sys
 import termios
@@ -118,6 +119,20 @@ def safe_text(value, limit=64):
     text = str(value).encode("utf-8", "replace").decode("utf-8", "replace")
     text = "".join(ch for ch in text if ch.isprintable())
     return text[:limit] or "?"
+
+
+def device_id_for(name):
+    """Stable id for this client in the server's usage records.
+
+    Derived from the host name and the client name, so it survives restarts
+    without a state file (the gateway's systemd unit has nowhere to write one).
+    Only a hash leaves the machine.
+    """
+    try:
+        host = socket.gethostname()
+    except OSError:
+        host = ""
+    return "cli-" + hashlib.sha256(f"{host}|{name}".encode("utf-8")).hexdigest()[:24]
 
 
 def normalize_ws_url(url):
@@ -1313,7 +1328,15 @@ class WalkieClient:
             self.roger_beep = msg.get("rogerBeep") is True
             print(f"[roger beep: {'ON' if self.roger_beep else 'off'} (server setting)]", flush=True)
             token =self.token if self.verified else None
-            await self.send({"type": "join", "name": self.name, "token": token})
+            # device/role are for the server's usage records. A gateway says so,
+            # so "could a person hear this" never depends on its name.
+            await self.send({
+                "type": "join",
+                "name": self.name,
+                "token": token,
+                "device": device_id_for(self.name),
+                "role": "gateway" if self.ptt is not None else "cli",
+            })
 
         elif mtype == "peers":
             incoming_ids = {p["id"] for p in msg["peers"]}

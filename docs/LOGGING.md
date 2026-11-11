@@ -73,6 +73,19 @@ caps them at 5 files of 10 MB.
 its contents), `ptt-start-ignored`, `ptt-stop-ignored`, `ignored-before-join`,
 `unknown-message`.
 
+## Usage database
+
+The same events are also written to a SQLite file (see [STATS.md](STATS.md)).
+The log lines above did not change. Three lines are about the database itself:
+
+| Event | Level | Meaning |
+|---|---|---|
+| `store-disabled` | error | The database could not be opened (old Node, data directory not writable). The server runs without it. |
+| `store-error` | error | A write failed. At most one line a minute; `suppressed` counts the rest. The channel is not affected. |
+| `store-maintenance` | info | Old raw events were deleted (`purged`) or the daily backup was written (`backup`, `removed`). |
+
+The `config` line says `stats_db="on"`, `"off"` or `"open-failed"`.
+
 ## Fields
 
 When lines were dropped by a rate limit, the next line that does get written

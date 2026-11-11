@@ -835,6 +835,32 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         await c.handle_message(json.dumps({"type": "welcome", "id": "aaaa"}))
         self.assertEqual(c.sent[-1]["token"], "secret-token-value")
 
+    async def test_join_says_which_device_and_role(self):
+        gateway, _ = self.make_client()
+        await gateway.handle_message(json.dumps({"type": "welcome", "id": "aaaa"}))
+        join = gateway.sent[-1]
+        self.assertEqual(join["role"], "gateway")
+        self.assertRegex(join["device"], r"^[A-Za-z0-9_-]{8,64}$")
+
+        # Same machine and name: same id next time. Another name: another id.
+        self.assertEqual(join["device"], cli.device_id_for("Radio"))
+        self.assertNotEqual(join["device"], cli.device_id_for("Kitchen"))
+
+        plain = cli.WalkieClient("wss://x", "Kitchen", "src", "sink", None, "system")
+        plain.sent = []
+
+        async def fake_send(m):
+            plain.sent.append(m)
+
+        plain.send = fake_send
+        await plain.handle_message(json.dumps({"type": "welcome", "id": "bbbb"}))
+        self.assertEqual(plain.sent[-1]["role"], "cli")
+
+    async def test_floor_with_a_transmission_id_is_handled_like_before(self):
+        c, ptt = self.make_client()
+        await c.handle_message(json.dumps({"type": "floor", "holder": "bbbb", "name": "Dad", "priority": False, "tx": "tabc123"}))
+        self.assertTrue(ptt.keyed)
+
     # ---------- roger beep ----------
 
     def make_beep_client(self, roger=True, keyed_gateway=True):

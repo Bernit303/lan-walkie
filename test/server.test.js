@@ -4,10 +4,15 @@ const { test, before, after, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const net = require('node:net');
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const WebSocket = require('ws');
 
 const TOKEN = 'test-token-0123456789abcdef';
+// The usage database of the main test server goes to a throwaway directory,
+// never into the repository. Throwaway servers run without one unless a test asks.
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'walkie-test-data-'));
 let server;
 let port;
 let serverLog = ''; // everything the main test server has printed so far
@@ -63,7 +68,7 @@ before(async () => {
   port = await freePort();
   server = spawn('node', ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: { ...process.env, PORT: String(port), MAX_TRANSMIT_MS: '1000', PRIORITY_TOKEN: TOKEN, MAX_CLIENTS: '8', HEARTBEAT_MS: '300' },
+    env: { ...process.env, PORT: String(port), MAX_TRANSMIT_MS: '1000', PRIORITY_TOKEN: TOKEN, MAX_CLIENTS: '8', HEARTBEAT_MS: '300', DATA_DIR },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', (d) => { serverLog += d; });
@@ -234,7 +239,7 @@ async function welcomeFrom(extraEnv) {
   const p = await freePort();
   const child = spawn('node', ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: { ...process.env, PORT: String(p), ...extraEnv },
+    env: { ...process.env, PORT: String(p), STATS: 'off', ...extraEnv },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   try {
@@ -291,7 +296,7 @@ async function startServer(extraEnv) {
   const p = await freePort();
   const child = spawn('node', ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: { ...process.env, PORT: String(p), HEARTBEAT_MS: '300', ...extraEnv },
+    env: { ...process.env, PORT: String(p), HEARTBEAT_MS: '300', STATS: 'off', ...extraEnv },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const handle = { port: p, child, out: '' };
@@ -737,4 +742,259 @@ test('normal-sized negotiation still gets through', async () => {
     for (const w of socks) w.terminate();
     s.child.kill();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Usage records: the optional protocol fields and what lands in the database.
+// ---------------------------------------------------------------------------
+
+let sqlite = null;
+try { sqlite = require('node:sqlite'); } catch { /* older Node: the server runs without the database */ }
+const noSqlite = sqlite ? false : 'node:sqlite is not available in this Node version';
+
+// Reads the main test server's database while the server is running.
+function query(sql, ...args) {
+  const db = new sqlite.DatabaseSync(path.join(DATA_DIR, 'walkie.db'), { readOnly: true });
+  try {
+    return db.prepare(sql).all(...args).map((r) => ({ ...r }));
+  } finally {
+    db.close();
+  }
+}
+
+// Joins with any extra `join` fields and optional HTTP headers (a browser sends Origin).
+async function joinAs(name, extra = {}, headers = {}) {
+  const ws = new WebSocket(`wss://127.0.0.1:${port}`, { rejectUnauthorized: false, headers });
+  ws.msgs = [];
+  ws.on('message', (d) => ws.msgs.push(JSON.parse(d)));
+  sockets.push(ws);
+  await new Promise((resolve, reject) => { ws.on('open', resolve); ws.on('error', reject); });
+  ws.id = (await waitFor(() => last(ws, 'welcome'))).id;
+  send(ws, { type: 'join', name, ...extra });
+  await sleep(100);
+  return ws;
+}
+
+test('floor messages carry a transmission id while someone talks, and null when free', async () => {
+  const a = await client('Alice', null);
+  const b = await client('Bob', null);
+  send(a, { type: 'ptt-start' });
+  const first = await waitFor(() => last(b, 'floor')?.holder === a.id && last(b, 'floor'));
+  assert.match(first.tx, /^t[0-9a-z]{8,}$/);
+  assert.equal(last(a, 'floor').tx, first.tx, 'everyone must see the same id');
+
+  // Someone who joins mid-transmission gets the same id.
+  const late = await client('Late', null);
+  assert.equal((await waitFor(() => last(late, 'floor'))).tx, first.tx);
+
+  send(a, { type: 'ptt-stop' });
+  const free = await waitFor(() => last(b, 'floor')?.holder === null && last(b, 'floor'));
+  assert.equal(free.tx, null);
+
+  send(b, { type: 'ptt-start' });
+  const second = await waitFor(() => last(a, 'floor')?.holder === b.id && last(a, 'floor'));
+  assert.notEqual(second.tx, first.tx, 'each transmission needs its own id');
+});
+
+test('join records the device and role; bad or missing values are replaced, never trusted', { skip: noSqlite }, async () => {
+  await joinAs('Good', { device: 'device-good-0001', role: 'gateway' });
+  await joinAs('NoFields');
+  await joinAs('BadFields', { device: '../../etc/passwd', role: 'admin' }, { Origin: 'https://walkie.test' });
+  await joinAs('NotStrings', { device: { a: 1 }, role: 7 });
+  await joinAs('TooShort', { device: 'abc' });
+
+  const rows = await waitFor(() => {
+    const r = query("SELECT name, device_id, role FROM sessions WHERE name IN ('Good', 'NoFields', 'BadFields', 'NotStrings', 'TooShort')");
+    return r.length === 5 && r;
+  });
+  assert.ok(rows, 'the sessions were not recorded');
+  const by = Object.fromEntries(rows.map((r) => [r.name, r]));
+  assert.deepEqual(by.Good, { name: 'Good', device_id: 'device-good-0001', role: 'gateway' });
+  // No role given: no Origin header means the CLI, an Origin header means a browser.
+  assert.equal(by.NoFields.role, 'cli');
+  assert.equal(by.BadFields.role, 'browser');
+  assert.equal(by.NotStrings.role, 'cli');
+  for (const name of ['NoFields', 'BadFields', 'NotStrings', 'TooShort']) {
+    assert.match(by[name].device_id, /^auto-[0-9a-f]{16}$/, `${name} got ${by[name].device_id}`);
+  }
+  assert.equal(server.exited, false);
+});
+
+test('a device without an id keeps the same derived id across reconnects', { skip: noSqlite }, async () => {
+  const first = await joinAs('Stable');
+  first.terminate();
+  await sleep(100);
+  await joinAs('Stable');
+  const ids = await waitFor(() => {
+    const r = query("SELECT DISTINCT device_id FROM sessions WHERE name = 'Stable'");
+    return query("SELECT COUNT(*) AS n FROM sessions WHERE name = 'Stable'")[0].n === 2 && r;
+  });
+  assert.equal(ids.length, 1);
+});
+
+test('the database tells a transmission: who, how long, how it ended, and who could hear it', { skip: noSqlite }, async () => {
+  const radio = await joinAs('StoryRadio', { device: 'story-radio-0001', role: 'gateway' });
+  const phone = await joinAs('StoryPhone', { device: 'story-phone-0001', role: 'browser' }, { Origin: 'https://walkie.test' });
+  const other = await joinAs('StoryOther', { device: 'story-other-0001', role: 'gateway' });
+
+  // 1. Heard: the phone is on screen. (The other gateway never counts as a person.)
+  send(radio, { type: 'ptt-start' });
+  const tx1 = (await waitFor(() => last(phone, 'floor')?.tx && last(phone, 'floor'))).tx;
+  send(phone, { type: 'ptt-start' }); // denied
+  await sleep(150);
+  send(radio, { type: 'ptt-stop' });
+  await waitFor(() => last(phone, 'floor')?.holder === null);
+
+  // 2. Not heard: the phone's screen locked.
+  send(phone, { type: 'presence', visible: false, audible: false });
+  send(phone, { type: 'presence', visible: false, audible: false }); // no change: not recorded twice
+  await sleep(100);
+  send(radio, { type: 'ptt-start' });
+  const tx2 = (await waitFor(() => last(phone, 'floor')?.tx && last(phone, 'floor'))).tx;
+  send(radio, { type: 'ptt-stop' });
+  await waitFor(() => last(phone, 'floor')?.holder === null);
+
+  // 3. Hidden but audible (a desktop tab with background audio) counts as heard.
+  send(phone, { type: 'presence', visible: false, audible: true });
+  await sleep(100);
+  send(radio, { type: 'ptt-start' });
+  const tx3 = (await waitFor(() => last(phone, 'floor')?.tx && last(phone, 'floor'))).tx;
+  // The phone drops mid-transmission.
+  phone.terminate();
+  await sleep(150);
+  radio.terminate(); // and the radio's connection dies while talking
+  await sleep(200);
+  other.terminate();
+
+  const txs = await waitFor(() => {
+    const r = query('SELECT * FROM transmissions WHERE id IN (?, ?, ?) AND ended_at IS NOT NULL ORDER BY started_at', tx1, tx2, tx3);
+    return r.length === 3 && r;
+  });
+  assert.ok(txs, 'the transmissions were not recorded');
+  const [t1, t2, t3] = txs;
+  assert.equal(t1.name, 'StoryRadio');
+  assert.equal(t1.device_id, 'story-radio-0001');
+  assert.equal(t1.role, 'gateway');
+  assert.equal(t1.end_reason, 'ptt-stop');
+  assert.equal(t1.listeners, 2);
+  assert.equal(t1.listeners_audible, 1);
+  assert.ok(t1.held_ms >= 100 && t1.held_ms < 5000, `held_ms ${t1.held_ms}`);
+  assert.equal(t1.ended_at - t1.started_at, t1.held_ms);
+
+  assert.equal(t2.listeners, 2);
+  assert.equal(t2.listeners_audible, 0, 'a locked phone was counted as a listener');
+
+  assert.equal(t3.listeners_audible, 1);
+  assert.equal(t3.listeners_audible_end, 0, 'the phone had already dropped when it ended');
+  assert.equal(t3.end_reason, 'disconnect');
+
+  const denied = query('SELECT holder_tx FROM denied WHERE holder_tx = ?', tx1);
+  assert.equal(denied.length, 1);
+
+  const presence = query("SELECT visible, audible FROM presence WHERE session_id = (SELECT id FROM sessions WHERE name = 'StoryPhone') ORDER BY id");
+  assert.deepEqual(presence, [{ visible: 0, audible: 0 }, { visible: 0, audible: 1 }]);
+
+  const session = await waitFor(() => query("SELECT * FROM sessions WHERE name = 'StoryPhone' AND left_at IS NOT NULL")[0]);
+  assert.ok(session, 'the leave was not recorded');
+  assert.equal(session.origin, 'https://walkie.test');
+  assert.ok(session.joined_at >= session.connected_at);
+  assert.ok(session.left_at >= session.joined_at);
+  assert.equal(typeof session.leave_code, 'number');
+
+  const device = query("SELECT kind, last_name FROM devices WHERE id = 'story-radio-0001'")[0];
+  assert.deepEqual(device, { kind: 'gateway', last_name: 'StoryRadio' });
+
+  // The raw event log has the same story, in order.
+  const events = query('SELECT event FROM events WHERE conn_id = ? ORDER BY id', radio.id).map((r) => r.event);
+  assert.deepEqual(events, [
+    'connect', 'join',
+    'floor-granted', 'floor-released',
+    'floor-granted', 'floor-released',
+    'floor-granted', 'floor-released',
+    'leave',
+  ]);
+});
+
+test('a preemption and a timeout are recorded as how the transmission ended', { skip: noSqlite }, async () => {
+  const normal = await joinAs('EndNormal', { device: 'end-normal-0001' });
+  const boss = await joinAs('EndBoss', { device: 'end-boss-00001', token: TOKEN });
+  send(normal, { type: 'ptt-start' });
+  const tx1 = (await waitFor(() => last(boss, 'floor')?.tx && last(boss, 'floor'))).tx;
+  send(boss, { type: 'ptt-start' }); // preempts
+  const tx2 = (await waitFor(() => last(normal, 'floor')?.holder === boss.id && last(normal, 'floor'))).tx;
+  // ...and never lets go: the server's limit (1 s in tests) ends it.
+  await waitFor(() => last(normal, 'floor')?.holder === null, 3000);
+
+  const rows = await waitFor(() => {
+    const r = query('SELECT id, end_reason, preempted_by, priority FROM transmissions WHERE id IN (?, ?) AND ended_at IS NOT NULL ORDER BY started_at', tx1, tx2);
+    return r.length === 2 && r;
+  });
+  assert.ok(rows);
+  assert.deepEqual(rows[0], { id: tx1, end_reason: 'preempted', preempted_by: tx2, priority: 0 });
+  assert.deepEqual(rows[1], { id: tx2, end_reason: 'timeout', preempted_by: null, priority: 1 });
+});
+
+test('presence before joining, or with junk values, is ignored', { skip: noSqlite }, async () => {
+  const before = query('SELECT COUNT(*) AS n FROM presence')[0].n;
+  const ws = await open();
+  send(ws, { type: 'presence', visible: false });
+  const c = await joinAs('Junk');
+  for (const visible of ['no', 0, null, undefined, {}]) send(c, { type: 'presence', visible });
+  await sleep(200);
+  assert.equal(query('SELECT COUNT(*) AS n FROM presence')[0].n, before);
+  assert.equal(server.exited, false);
+});
+
+test('the token never reaches the database', { skip: noSqlite }, async () => {
+  await joinAs('Secretive', { token: TOKEN });
+  await joinAs('Wrong', { token: 'wrong-token-zzzzzzzzzzzzzzzz' });
+  await sleep(200);
+  const dump = JSON.stringify([query('SELECT * FROM events'), query('SELECT * FROM sessions'), query('SELECT * FROM devices')]);
+  assert.ok(!dump.includes(TOKEN));
+  assert.ok(!dump.includes('wrong-token-zzzz'));
+});
+
+test('STATS=off: the channel works and no database is created', async () => {
+  const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'walkie-test-off-')), 'data');
+  const s = await startServer({ STATS: 'off', DATA_DIR: dir });
+  const socks = [];
+  try {
+    const a = await connectTo(s.port, 'A');
+    const b = await connectTo(s.port, 'B');
+    socks.push(a, b);
+    a.send(JSON.stringify({ type: 'ptt-start' }));
+    const floor = await waitFor(() => last(b, 'floor')?.holder === a.id && last(b, 'floor'));
+    assert.match(floor.tx, /^t[0-9a-z]+$/, 'the transmission id does not depend on the database');
+    assert.ok(s.out.includes('stats_db="off"'));
+    assert.equal(fs.existsSync(dir), false);
+  } finally {
+    for (const w of socks) w.terminate();
+    s.child.kill();
+  }
+});
+
+test('a data directory that cannot be written does not stop the server', async () => {
+  const blocker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'walkie-test-bad-')), 'file');
+  fs.writeFileSync(blocker, 'x');
+  const s = await startServer({ STATS: 'on', DATA_DIR: path.join(blocker, 'data') });
+  const socks = [];
+  try {
+    const a = await connectTo(s.port, 'A');
+    const b = await connectTo(s.port, 'B');
+    socks.push(a, b);
+    a.send(JSON.stringify({ type: 'ptt-start' }));
+    assert.ok(await waitFor(() => last(b, 'floor')?.holder === a.id));
+    assert.ok(s.out.includes(' store-disabled '));
+  } finally {
+    for (const w of socks) w.terminate();
+    s.child.kill();
+  }
+});
+
+test('the first start writes a backup of the database', { skip: noSqlite }, async () => {
+  const files = await waitFor(() => {
+    try { return fs.readdirSync(path.join(DATA_DIR, 'backups')).filter((f) => /^walkie-\d{8}\.db$/.test(f)); } catch { return null; }
+  });
+  assert.equal(files && files.length, 1);
+  assert.ok(has(0, ' INFO  store-maintenance ', 'backup="walkie-'));
 });

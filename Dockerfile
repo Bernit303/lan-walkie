@@ -15,10 +15,13 @@ COPY public ./public
 # The cert volume mounts here; owned by the unprivileged user so the server
 # can generate and read its key without running as root.
 RUN mkdir -p /app/certs && chown -R node:node /app/certs
+# The data volume (usage database and its backups) mounts here.
+RUN mkdir -p /app/data && chown -R node:node /app/data
 USER node
 
 EXPOSE 8443
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD wget -q --no-check-certificate -O /dev/null https://127.0.0.1:${PORT:-8443}/ || exit 1
 
-CMD ["node", "server.js"]
+# node:sqlite prints an "experimental" warning on some Node versions; keep it out of the log.
+CMD ["node", "--disable-warning=ExperimentalWarning", "server.js"]

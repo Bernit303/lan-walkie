@@ -47,7 +47,8 @@ docker compose up -d --build
 
 ### Node
 
-Needs Node.js 20 or newer and `openssl` on the path.
+Needs Node.js 20 or newer and `openssl` on the path. The usage database needs
+Node.js 22.13 or newer; on an older version the server runs without it.
 
 ```bash
 npm ci
@@ -145,6 +146,9 @@ Everything is an optional environment variable on the server.
 | `LOG_FORMAT` | `text` | `text`, or `json` for one JSON object per line |
 | `LOG_STATS_MS` | `300000` | Interval of the one-line `stats` summary. `0` turns it off |
 | `ROGER_BEEP` | `off` | `on` plays a short beep on every client when the channel is released. Restart to change |
+| `STATS` | `on` | Usage database (who talked, when, how long, who could hear it). `off` disables it. See [docs/STATS.md](docs/STATS.md) |
+| `DATA_DIR` | `data/` | Where the usage database and its backups are kept |
+| `EVENT_RETENTION_DAYS` | `400` | Days of raw events to keep in the usage database |
 
 Generate a priority token with `openssl rand -hex 24`. Short or placeholder
 values are refused: the server logs an error and runs with priority disabled.
@@ -192,6 +196,7 @@ server by default (set an empty STUN setting on a LAN or VPN to avoid it).
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): Docker, systemd, Tailscale Serve
 - [docs/AIOC.md](docs/AIOC.md): radio gateway hardware, behaviour and safety
 - [cli/README.md](cli/README.md): headless client and gateway reference
+- [docs/STATS.md](docs/STATS.md): the usage database, its tables and example queries
 - [docs/ALERTS.md](docs/ALERTS.md): phone alerts and remote commands
 - [docs/LOGGING.md](docs/LOGGING.md): log events and fields
 - [CHANGELOG.md](CHANGELOG.md): what changed

@@ -10,6 +10,8 @@ services:
       - "${BIND_ADDR:-0.0.0.0}:8443:8443"
     volumes:
       - lan-walkie-certs:/app/certs
+      # Usage database (walkie.db) and its daily backups. See docs/STATS.md.
+      - lan-walkie-data:/app/data
     environment:
       # Each value can be set in Portainer's "Environment variables" section
       # (or an .env file next to this compose file); the defaults apply when
@@ -29,6 +31,10 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - LOG_FORMAT=${LOG_FORMAT:-text}
       - LOG_STATS_MS=${LOG_STATS_MS:-300000}
+      # Usage database (docs/STATS.md): STATS on|off, and how many days of raw
+      # events to keep. Sessions and transmissions are kept without limit.
+      - STATS=${STATS:-on}
+      - EVENT_RETENTION_DAYS=${EVENT_RETENTION_DAYS:-400}
       # Generate with: openssl rand -hex 24  (16+ chars; unset = priority off)
       - PRIORITY_TOKEN=${PRIORITY_TOKEN:-}
       # Comma-separated browser origins allowed to open the WebSocket.
@@ -55,3 +61,4 @@ services:
 
 volumes:
   lan-walkie-certs:
+  lan-walkie-data:
