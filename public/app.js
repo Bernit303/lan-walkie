@@ -65,7 +65,7 @@ for (const evt of ['pointerdown', 'touchend', 'keydown', 'click']) {
 }
 
 function playRogerBeep() {
-  if (document.hidden) return;
+  if (receiveMuted()) return;
   try {
     if (!beepCtx || beepCtx.state !== 'running') return; // not unlocked yet: stay silent
     // One oscillator for the whole warble, so the phase stays continuous when
@@ -231,6 +231,62 @@ for (const evt of ['pointerdown', 'keydown']) {
   window.addEventListener(evt, noteActivity, { passive: true });
 }
 renderWakeStatus();
+
+// Received audio while the page is hidden. Phones stay silent in the
+// background, as before. A desktop tab keeps playing (a setting, on by
+// default): calls used to be lost to a tab that was merely behind another one.
+const BG_AUDIO_KEY = 'walkie-bg-audio';
+const userAgent = String(navigator.userAgent || '');
+const isPhone = navigator.userAgentData && typeof navigator.userAgentData.mobile === 'boolean'
+  ? navigator.userAgentData.mobile
+  : /Android|iPhone|iPad|iPod|Mobile/i.test(userAgent) || (/Macintosh/.test(userAgent) && navigator.maxTouchPoints > 1);
+const bgAudioRow = document.getElementById('bg-audio-row');
+const bgAudioCheck = document.getElementById('bg-audio');
+let bgAudio = false;
+if (!isPhone) {
+  try { bgAudio = localStorage.getItem(BG_AUDIO_KEY) !== 'off'; } catch { bgAudio = true; }
+  bgAudioRow.classList.remove('hidden');
+  bgAudioCheck.checked = bgAudio;
+  bgAudioCheck.addEventListener('change', () => setBgAudio(bgAudioCheck.checked === true));
+}
+
+function setBgAudio(on) {
+  if (isPhone) return;
+  bgAudio = !!on;
+  try { localStorage.setItem(BG_AUDIO_KEY, bgAudio ? 'on' : 'off'); } catch {}
+  applyReceiveMute();
+}
+
+const receiveMuted = () => document.hidden && !bgAudio;
+
+function applyReceiveMute() {
+  for (const el of audioEls.values()) el.muted = receiveMuted();
+}
+
+// A call that arrives while the page is hidden is shown in the tab title and,
+// where the browser supports it, as a badge on the installed app's icon. It
+// stays until the page is looked at again.
+const BASE_TITLE = 'LAN Walkie';
+let floorName = null; // name of whoever holds the floor
+let missedCaller = null; // someone talked while the page was hidden
+let noticeShown = false;
+
+function updateCallNotice() {
+  const talking = floorHolder && floorHolder !== myId ? String(floorName || 'Someone') : null;
+  if (!document.hidden) missedCaller = null;
+  else if (talking) missedCaller = talking;
+  let title = BASE_TITLE;
+  if (document.hidden && talking) title = `● ${talking} talking`;
+  else if (missedCaller) title = `● ${missedCaller} called`;
+  document.title = title;
+  const show = title !== BASE_TITLE;
+  if (show === noticeShown) return;
+  noticeShown = show;
+  try {
+    const fn = show ? navigator.setAppBadge : navigator.clearAppBadge;
+    if (typeof fn === 'function') Promise.resolve(fn.call(navigator)).catch(() => {});
+  } catch {}
+}
 
 let joining = false;
 let rosterIds = new Set(); // peers the server currently lists
@@ -398,7 +454,9 @@ function connect() {
     if (msg.type === 'floor') {
       const previousHolder = floorHolder;
       floorHolder = msg.holder;
+      floorName = msg.name;
       noteActivity();
+      updateCallNotice();
       if (floorHolder === myId) {
         if (!wantTalk) {
           // The button was released before the grant arrived. Give the
@@ -505,6 +563,8 @@ function resetForReconnect() {
   for (const id of [...peers.keys()]) removePeer(id);
   retryCounts.clear();
   floorHolder = null;
+  floorName = null;
+  updateCallNotice();
   wantTalk = false;
   if (audioTrack) audioTrack.enabled = false;
   pttBtn.classList.remove('active');
@@ -544,7 +604,7 @@ function createPeer(id, initiator) {
       audioEls.set(id, audioEl);
     }
     audioEl.srcObject = event.streams[0];
-    audioEl.muted = document.hidden; // nothing plays while the app is in the background
+    audioEl.muted = receiveMuted(); // phones play nothing while the app is in the background
 
     // Chrome-only, silently ignored elsewhere: shrinks the jitter buffer's
     // target delay. Worth trading a little resilience to network jitter for
@@ -670,9 +730,10 @@ window.addEventListener('blur', stopTalk);
 window.addEventListener('pagehide', stopTalk);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) stopTalk();
-  // Foreground only: received audio is muted (not torn down, so no tap is
-  // needed to resume) while hidden.
-  for (const el of audioEls.values()) el.muted = document.hidden;
+  // Received audio is muted (not torn down, so no tap is needed to resume)
+  // while hidden, except on a desktop with background audio on.
+  applyReceiveMute();
+  updateCallNotice();
   updateWakeLock(); // the browser dropped the lock when the page was hidden: ask again
 });
 

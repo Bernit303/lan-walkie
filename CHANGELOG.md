@@ -9,6 +9,11 @@
   "Always while open" (default), "During conversations" (while someone talks and for 10 minutes
   after the last floor change, own talk or touch) and "Off". The choice is remembered per
   device. No server or protocol change.
+- Browser, desktop only: a tab in the background keeps playing received audio ("Play audio in
+  the background", on by default). Phones stay silent while hidden, as before.
+- Browser: a call that arrives while the page is hidden shows in the tab title
+  ("● Radio talking", then "● Radio called" until the page is looked at) and as a badge on the
+  installed app's icon where supported.
 
 ### Fixed
 - Radio gateway going deaf: twice in one day (2026-11-05 evening and 2026-11-06) the gateway

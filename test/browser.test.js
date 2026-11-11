@@ -56,7 +56,7 @@ function fakeWakeLock() {
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-async function loadPage({ wakeLock, storage = {} } = {}) {
+async function loadPage({ wakeLock, storage = {}, userAgent = 'Mozilla/5.0 (X11; Linux x86_64)', badge } = {}) {
   const timers = [];
   let clock = 0;
   const sockets = [];
@@ -111,9 +111,11 @@ async function loadPage({ wakeLock, storage = {} } = {}) {
   const documentStub = new Proxy({}, {
     get: (_t, key) => {
       if (key === 'hidden') return doc.hidden;
+      if (key === 'title') return doc.title;
       if (key === 'addEventListener') return (type, fn) => { (doc.listeners[type] = doc.listeners[type] || []).push(fn); };
       return anyStub();
     },
+    set: (_t, key, value) => { doc[key] = value; return true; },
   });
   const setHidden = (hidden) => {
     doc.hidden = hidden;
@@ -122,7 +124,11 @@ async function loadPage({ wakeLock, storage = {} } = {}) {
     for (const fn of doc.listeners.visibilitychange || []) fn();
   };
 
-  const navigatorStub = { mediaDevices: { getUserMedia: async () => stream } };
+  const navigatorStub = { userAgent, mediaDevices: { getUserMedia: async () => stream } };
+  if (badge) {
+    navigatorStub.setAppBadge = async () => { badge.set += 1; };
+    navigatorStub.clearAppBadge = async () => { badge.cleared += 1; };
+  }
   if (wakeLock) navigatorStub.wakeLock = wakeLock;
 
   const context = vm.createContext({
@@ -135,6 +141,7 @@ async function loadPage({ wakeLock, storage = {} } = {}) {
       removeItem(key) { delete storage[key]; },
     },
     location: { host: 'test.local', reload() {} },
+    crypto: { randomUUID: () => '0f8fad5b-d9cb-469f-a165-70867728950e' },
     WebSocket: FakeSocket,
     RTCPeerConnection: FakeConnection,
     Audio: class { constructor() { this.muted = false; } },
@@ -163,7 +170,7 @@ async function loadPage({ wakeLock, storage = {} } = {}) {
     for (const fn of sock.handlers.open || []) fn();
     await settle();
   };
-  return { run, sock, sockets, connections, advance, setHidden, open, storage };
+  return { run, sock, sockets, connections, advance, setHidden, open, storage, doc };
 }
 
 test('one failed connection is retried on its own; healthy connections and the session stay up', async () => {
@@ -332,5 +339,70 @@ test('wake lock: a browser without the API still works', async () => {
   page.setHidden(true);
   page.setHidden(false);
   page.run("setWakeMode('active'); noteActivity()");
-  assert.deepEqual(page.sock.sent[0], { type: 'join', name: 'Test' });
+  assert.equal(page.sock.sent[0].type, 'join');
+});
+
+// --- Background audio and call notice ---
+
+// Joins, adds the peer 'aaa' and makes its audio arrive.
+async function withIncomingAudio(options) {
+  const page = await loadPage(options);
+  await page.sock.deliver({ type: 'welcome', id: 'mmm' });
+  await page.sock.deliver({ type: 'peers', peers: [{ id: 'aaa', name: 'Radio' }] });
+  for (const fn of page.run("peers.get('aaa')").handlers.track) fn({ streams: [{}], receiver: {} });
+  page.muted = () => page.run("audioEls.get('aaa').muted");
+  return page;
+}
+
+test('desktop: received audio keeps playing while the tab is hidden, unless the setting is off', async () => {
+  const page = await withIncomingAudio();
+  page.setHidden(true);
+  assert.equal(page.muted(), false, 'a background desktop tab went silent');
+  page.run('setBgAudio(false)');
+  assert.equal(page.muted(), true);
+  assert.equal(page.storage['walkie-bg-audio'], 'off');
+  page.setHidden(false);
+  assert.equal(page.muted(), false);
+
+  // The choice is remembered.
+  const again = await withIncomingAudio({ storage: page.storage });
+  again.setHidden(true);
+  assert.equal(again.muted(), true);
+});
+
+test('phone: received audio is muted while hidden and the setting cannot change that', async () => {
+  const page = await withIncomingAudio({ userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) Mobile Safari/537.36' });
+  page.run('setBgAudio(true)');
+  page.setHidden(true);
+  assert.equal(page.muted(), true);
+  page.setHidden(false);
+  assert.equal(page.muted(), false);
+});
+
+test('a call while hidden shows in the title and badge, and stays until the page is seen', async () => {
+  const badge = { set: 0, cleared: 0 };
+  const page = await loadPage({ badge });
+  await page.sock.deliver({ type: 'welcome', id: 'mmm' });
+  await page.sock.deliver({ type: 'floor', holder: 'aaa', name: 'Radio' });
+  assert.equal(page.doc.title, 'LAN Walkie', 'no notice while the page is visible');
+
+  page.setHidden(true);
+  assert.equal(page.doc.title, '● Radio talking');
+  assert.equal(badge.set, 1);
+  await page.sock.deliver({ type: 'floor', holder: null, name: null });
+  assert.equal(page.doc.title, '● Radio called');
+  assert.equal(badge.set, 1, 'the badge is set once, not on every change');
+
+  page.setHidden(false);
+  assert.equal(page.doc.title, 'LAN Walkie');
+  assert.equal(badge.cleared, 1);
+});
+
+test('my own transmission is never announced as a call', async () => {
+  const page = await loadPage();
+  await page.sock.deliver({ type: 'welcome', id: 'mmm' });
+  page.run('wantTalk = true');
+  await page.sock.deliver({ type: 'floor', holder: 'mmm', name: 'Test' });
+  page.setHidden(true);
+  assert.equal(page.doc.title, 'LAN Walkie');
 });

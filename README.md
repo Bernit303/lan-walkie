@@ -88,6 +88,14 @@ Limits:
 - Inside an iframe (for example a Home Assistant dashboard) the frame needs
   `allow="screen-wake-lock"`.
 
+### On a desktop
+
+A tab in the background keeps playing received audio ("Play audio in the
+background", on by default, desktop only). When someone talks while the tab is
+hidden, the tab title changes to "● Name talking" and stays as "● Name called"
+until you look at the tab. An installed app also gets a badge on its icon where
+the browser supports it.
+
 ## Ways to talk
 
 | Client | How |
