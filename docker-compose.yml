@@ -4,6 +4,9 @@ services:
     image: lan-walkie:latest
     container_name: lan-walkie
     restart: unless-stopped
+    # A tiny init as process 1: it reaps the short-lived children the healthcheck's wget
+    # leaves behind (otherwise they pile up as zombie processes).
+    init: true
     ports:
       # BIND_ADDR defaults to every interface. Set it to the LAN IP, or to
       # 127.0.0.1 if everything goes through Tailscale Serve on this host.

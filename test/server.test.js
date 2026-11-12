@@ -224,6 +224,23 @@ test('a connection that stops answering protocol pings is dropped and frees the 
   await waitFor(() => ghost.readyState === WebSocket.CLOSED, 1000);
 });
 
+test('a client that misses one protocol ping but answers the next is kept', async () => {
+  let pings = 0;
+  const flaky = await new Promise((resolve, reject) => {
+    const ws = new WebSocket(`wss://127.0.0.1:${port}`, { rejectUnauthorized: false, autoPong: false });
+    ws.msgs = [];
+    ws.on('message', (d) => ws.msgs.push(JSON.parse(d)));
+    ws.on('ping', () => { pings += 1; if (pings !== 2) ws.pong(); }); // skips exactly one
+    ws.on('open', () => resolve(ws));
+    ws.on('error', reject);
+    sockets.push(ws);
+  });
+  await waitFor(() => last(flaky, 'welcome'));
+  send(flaky, { type: 'join', name: 'Flaky' });
+  await waitFor(() => pings >= 6, 4000); // well past the point where one miss used to drop it
+  assert.equal(flaky.readyState, WebSocket.OPEN, 'one missed ping must not drop a client');
+});
+
 test('a browser that pings once then goes silent is dropped', async () => {
   const watcher = await client('Watcher2', null);
   const quiet = await client('Quiet', null);

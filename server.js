@@ -384,7 +384,7 @@ wss.on('connection', (ws, req) => {
 
   const id = crypto.randomBytes(8).toString('hex');
   const me = {
-    ws, name: 'Anon', priority: false, joined: false, alive: true, appPing: false, lastMsg: Date.now(),
+    ws, name: 'Anon', priority: false, joined: false, alive: true, missedPongs: 0, lastPong: Date.now(), appPing: false, lastMsg: Date.now(),
     connectedAt: Date.now(), endReason: null, ip: remoteIp(req), relayWindowStart: 0, relayBytes: 0,
     // For the usage records. A client is taken as on screen and audible until it says otherwise.
     device: null, role: null, visible: true, audible: true,
@@ -405,7 +405,7 @@ wss.on('connection', (ws, req) => {
     me.errorThrottle((suppressed) => log.warn('socket-error', { id: shortId(id), code: err && err.code, error: err && err.message, suppressed }));
     ws.terminate();
   });
-  ws.on('pong', () => { me.alive = true; });
+  ws.on('pong', () => { me.alive = true; me.missedPongs = 0; me.lastPong = Date.now(); });
 
   send(ws, { type: 'welcome', id, rogerBeep: ROGER_BEEP });
 
@@ -601,16 +601,46 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+// A client that does not answer protocol pings is dropped after this many
+// checks in a row with no answer, not after one: a pause of a few seconds on
+// the server (a stalled disk) or on the way (Wi-Fi, a Tailscale path change)
+// is not a dead connection. Browsers are judged on their own app-level ping.
+const MISSED_PONGS_LIMIT = Math.max(1, Number(process.env.MISSED_PONGS_LIMIT) || 2);
+// A check that runs this much later than it should means this process was
+// stalled, so what looks like silence may be replies it had not read yet.
+const LAG_SKIP_MS = Math.max(250, HEARTBEAT_MS / 5);
+let lastBeat = Date.now();
+const lagThrottle = createThrottle(60000);
+
 const heartbeat = setInterval(() => {
   const now = Date.now();
+  const lag = now - lastBeat - HEARTBEAT_MS;
+  lastBeat = now;
+  if (lag > LAG_SKIP_MS) {
+    // Judge nobody this round, and ping again so the answers can come in.
+    lagThrottle((suppressed) => log.warn('event-loop-lag', { lag_ms: Math.round(lag), clients: clients.size, suppressed }));
+    store.event('event-loop-lag', null, { lag_ms: Math.round(lag), clients: clients.size });
+    for (const c of clients.values()) {
+      c.alive = false;
+      try { c.ws.ping(); } catch { /* socket already going away */ }
+    }
+    return;
+  }
   for (const [id, c] of clients) {
     // Browsers ping at the application level, so judge them on that;
     // everyone else on protocol-level pongs.
-    const stale = c.appPing ? now - c.lastMsg > 2 * HEARTBEAT_MS + 1000 : !c.alive;
+    if (!c.appPing && !c.alive) c.missedPongs += 1;
+    const stale = c.appPing ? now - c.lastMsg > 2 * HEARTBEAT_MS + 1000 : c.missedPongs >= MISSED_PONGS_LIMIT;
     if (stale) {
+      const detail = {
+        name: c.joined ? c.name : undefined,
+        check: c.appPing ? 'app-ping' : 'protocol-ping',
+        silent_s: Math.round((now - c.lastMsg) / 1000),
+        since_pong_s: Math.round((now - c.lastPong) / 1000),
+      };
       c.endReason = 'dead-connection';
-      log.warn('dead-connection', { id: shortId(id), name: c.joined ? c.name : undefined, check: c.appPing ? 'app-ping' : 'protocol-ping', silent_s: Math.round((now - c.lastMsg) / 1000) });
-      store.event('dead-connection', id, { name: c.joined ? c.name : undefined, check: c.appPing ? 'app-ping' : 'protocol-ping', silent_s: Math.round((now - c.lastMsg) / 1000) });
+      log.warn('dead-connection', { id: shortId(id), ...detail });
+      store.event('dead-connection', id, detail);
       c.ws.terminate();
       continue;
     }

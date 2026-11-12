@@ -52,7 +52,8 @@ caps them at 5 files of 10 MB.
 | Event | Level | Fields | Meaning |
 |---|---|---|---|
 | `floor-timeout` | warn | id, name, held_ms, limit_ms | Someone held the channel for the whole `MAX_TRANSMIT_MS` without releasing (stuck button, frozen phone). |
-| `dead-connection` | warn | id, name, check, silent_s | The server stopped hearing from a client and dropped it (phone left Wi-Fi, battery died). `check` is `app-ping` (browser) or `protocol-ping`. |
+| `dead-connection` | warn | id, name, check, silent_s, since_pong_s | The server stopped hearing from a client and dropped it (phone left Wi-Fi, battery died). `check` is `app-ping` (browser) or `protocol-ping`. A protocol-ping client (the CLI, the radio gateway) is dropped after `MISSED_PONGS_LIMIT` (default 2) checks in a row with no answer. `silent_s` is the time since its last message of any kind (a quiet gateway has long silences that mean nothing); `since_pong_s` is the time since its last answer to a ping. |
+| `event-loop-lag` | warn | lag_ms, clients, suppressed | The server's own check ran late, so this process was stalled (a busy or stalled disk on the host). Nobody is judged on that round. At most one per minute. |
 | `priority-denied` | warn | id, name, reason | A client offered a priority token that did not count. `reason` is `wrong-token`, or `priority-disabled-on-server` when the server has no valid `PRIORITY_TOKEN`. The token itself is never logged. |
 | `priority-disabled` | error | reason, fix | `PRIORITY_TOKEN` is a placeholder or too short, so priority is off. |
 | `invalid-frame` | warn | id, reason, bytes | A message that is not a JSON object. Only its size is logged. Limited to one per 5 s per client. |

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+- Server: a client that is judged on protocol pings (the CLI and the radio gateway) was dropped
+  after a single missed check, about 5 to 10 seconds. A short stall of the host's disk or of
+  the network was enough to cut a healthy gateway. It now takes `MISSED_PONGS_LIMIT` (default 2)
+  missed checks in a row. A check that itself runs late (the server was stalled) judges nobody
+  and is logged as `event-loop-lag`. The `dead-connection` line gains `since_pong_s`.
+- Docker: `init: true`, so the zombie `ssl_client` processes the healthcheck's `wget` left
+  behind are cleaned up.
+
 ### Changed
 - Usage page: the radio gateway is no longer treated as one more person. It stands for
   everyone on the radio side, so it has its own section (time connected, each time it was cut
