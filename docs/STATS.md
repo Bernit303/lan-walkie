@@ -87,7 +87,7 @@ WHERE t.started_at > (unixepoch() - 7 * 86400) * 1000
 GROUP BY t.device_id ORDER BY minutes DESC;
 ```
 
-Radio calls nobody could hear:
+Radio traffic while nobody on the app was listening (normal: the people on the radio heard it):
 
 ```sql
 SELECT datetime(started_at / 1000, 'unixepoch', 'localtime') AS at, name, held_ms / 1000 AS seconds
@@ -110,13 +110,19 @@ GROUP BY day, leave_reason ORDER BY day DESC;
 `https://<server>:8443/admin.html` shows one day at a time (the day runs from
 midnight to midnight in the browser's timezone):
 
-- totals: minutes talked, transmissions, longest transmission, busiest hour,
-  connections and drops;
+- totals: minutes talked (split into the app and the radio), transmissions,
+  longest transmission, busiest hour, and connections and drops of **people**;
 - minutes talked per day for the last 30 days (click a bar to open that day);
-- radio calls nobody could hear;
+- the radio gateway, counted apart from people: how long it was connected, each
+  time it was cut off and how long it took to come back, and the calls from the
+  app that the radio never got (spoken while the gateway was not connected).
+  The gateway stands for everyone on the radio side, so a radio call with nobody
+  on the app is normal and only shown as a count;
 - conversations: transmissions less than `CONVERSATION_GAP_S` (60) seconds
-  apart, with who took part and for how long;
-- a timeline of connections per device, with dropped ones marked;
+  apart, labelled radio only, app only or radio and app, with who talked and the
+  people who were connected and only listening;
+- a timeline of connections per device with the radio gateway on top. A bar is
+  how long it was connected; a drop is the tall red mark at its end;
 - totals per device, and every transmission;
 - CSV export of the day's transmissions and connections.
 

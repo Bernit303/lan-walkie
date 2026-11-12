@@ -48,10 +48,15 @@
       <p id="daily-readout" class="readout" role="status">Point at a bar, or click it to open that day.</p>
     </section>
 
-    <section aria-labelledby="unheard-title">
-      <h2 id="unheard-title">Radio calls nobody could hear</h2>
-      <p id="unheard-summary" class="hint"></p>
-      <div class="table-scroll"><table id="unheard-table"></table></div>
+    <section aria-labelledby="gateway-title">
+      <h2 id="gateway-title">Radio gateway</h2>
+      <p class="hint">The gateway stands for everyone on the radio. It is counted apart from the people on the app.</p>
+      <dl id="gateway-tiles" class="tiles"></dl>
+      <h3 id="outages-title">Times it was cut off</h3>
+      <div class="table-scroll"><table id="outages-table" aria-labelledby="outages-title"></table></div>
+      <h3 id="missed-title">Calls from the app the radio never got</h3>
+      <p id="missed-summary" class="hint"></p>
+      <div class="table-scroll"><table id="missed-table" aria-labelledby="missed-title"></table></div>
     </section>
 
     <section aria-labelledby="conversations-title">
@@ -63,8 +68,8 @@
     <section aria-labelledby="timeline-title">
       <h2 id="timeline-title">Connections</h2>
       <p class="legend">
-        <span class="key"><span class="swatch swatch-session" aria-hidden="true"></span>Connected</span>
-        <span class="key"><span class="swatch swatch-drop" aria-hidden="true"></span>Ended as a dropped connection</span>
+        <span class="key"><span class="swatch swatch-session" aria-hidden="true"></span>Connected (the radio gateway is the top row)</span>
+        <span class="key"><span class="swatch swatch-drop" aria-hidden="true"></span>Dropped here (tall mark at the end)</span>
         <span class="key"><span class="swatch swatch-talk" aria-hidden="true"></span>Talking</span>
       </p>
       <div class="chart-scroll"><svg id="timeline" class="chart" role="img" aria-labelledby="timeline-title"></svg></div>
@@ -72,7 +77,7 @@
     </section>
 
     <section aria-labelledby="devices-title">
-      <h2 id="devices-title">By device</h2>
+      <h2 id="devices-title">People, by device</h2>
       <div class="table-scroll"><table id="devices-table"></table></div>
     </section>
 

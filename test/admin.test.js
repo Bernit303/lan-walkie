@@ -20,6 +20,7 @@ const TOKEN = 'admin-token-0123456789abcdef';
 const MIN = 60 * 1000;
 // A fixed day, far enough back that the server's "now" is never inside it.
 const DAY = Date.UTC(2026, 10, 10, 0, 0, 0);
+const DAY2 = DAY - 2 * 24 * 60 * MIN; // two days earlier
 const PHONE_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) Mobile Safari/537.36';
 
 // Radio and a phone talk in the morning (one conversation, 3 turns); the phone
@@ -47,6 +48,27 @@ function seed(dir) {
   tx('t6', 'radio01', 'Radio', 'gateway', DAY + 20 * 60 * MIN, 5, 0, 'timeout');
   store.sessionEnd({ connId: 'radio01', reason: 'closed', code: 1000, ts: DAY + 21 * 60 * MIN });
   store.event('seeded', null, {}, DAY + 21 * 60 * MIN);
+
+  // A second day: the gateway is cut off at 09:00 and is back at 09:02; a
+  // listener (Dad) is connected all morning and never talks; Mom talks once
+  // while the gateway is up and once while it is down.
+  const at2 = (minutes, seconds = 0) => DAY2 + 8 * 60 * MIN + minutes * MIN + seconds * 1000;
+  store.sessionStart({ connId: 'gwA', ip: '10.0.0.5', ua: 'Python/3.12', ts: at2(0) });
+  store.sessionJoin({ connId: 'gwA', deviceId: 'cli-gateway0001', name: 'Radio', role: 'gateway', ua: 'Python/3.12', ts: at2(0, 1) });
+  store.sessionStart({ connId: 'dad', ip: '10.0.0.8', ua: PHONE_UA, origin: 'https://walkie.test', ts: at2(5) });
+  store.sessionJoin({ connId: 'dad', deviceId: 'device-dad-00001', name: 'Dad', role: 'browser', ua: PHONE_UA, ts: at2(5, 1) });
+  store.sessionStart({ connId: 'mom2', ip: '10.0.0.9', ua: PHONE_UA, origin: 'https://walkie.test', ts: at2(6) });
+  store.sessionJoin({ connId: 'mom2', deviceId: 'device-phone-0001', name: 'Mom', role: 'browser', ua: PHONE_UA, ts: at2(6, 1) });
+  tx('u1', 'mom2', 'Mom', 'browser', at2(10), 10, 2); // gateway up
+  tx('u2', 'gwA', 'Radio', 'gateway', at2(10, 30), 20, 2); // same conversation: mixed
+  store.sessionEnd({ connId: 'gwA', reason: 'dead-connection', code: 1006, ts: at2(60) });
+  tx('u3', 'mom2', 'Mom', 'browser', at2(61), 8, 2); // gateway down: the radio never got it
+  store.sessionStart({ connId: 'gwB', ip: '10.0.0.5', ua: 'Python/3.12', ts: at2(62) });
+  store.sessionJoin({ connId: 'gwB', deviceId: 'cli-gateway0001', name: 'Radio', role: 'gateway', ua: 'Python/3.12', ts: at2(62, 1) });
+  tx('u4', 'gwB', 'Radio', 'gateway', at2(90), 30, 0); // radio talk with nobody on the app
+  store.sessionEnd({ connId: 'gwB', reason: 'closed', code: 1000, ts: at2(120) });
+  store.sessionEnd({ connId: 'dad', reason: 'closed', code: 1000, ts: at2(120) });
+  store.sessionEnd({ connId: 'mom2', reason: 'closed', code: 1000, ts: at2(120) });
   store.close();
 }
 
@@ -153,28 +175,60 @@ test('range: totals, per-device numbers and conversations match the data', { ski
     talk_ms: 151000,
     transmissions: 6,
     longest: { id: 't4', name: 'Radio', started_at: DAY + 8 * 60 * MIN + 15 * MIN, held_ms: 47000 },
-    sessions: 2, // the probe that never joined is not a participant
+    sessions: 1, // people only: the probe that never joined and the gateway are not counted
     drops: 1,
-    unheard_gateway: 3,
-    unheard_gateway_ms: 81000,
+    online: { sessions: 1, drops: 1, talk_ms: 10000, transmissions: 1 },
+    radio: { transmissions: 5, talk_ms: 141000, unmonitored: 3, unmonitored_ms: 81000 },
+    missed_by_radio: 0,
+    missed_by_radio_ms: 0,
   });
 
-  assert.equal(d.devices.length, 2);
-  const [radio, phone] = d.devices;
-  assert.deepEqual(radio, {
-    device_id: 'cli-gateway0001', name: 'Radio', role: 'gateway', kind: 'gateway',
-    talk_ms: 141000, transmissions: 5, connected_ms: 13 * 60 * MIN, sessions: 1, drops: 0,
-  });
-  assert.deepEqual(phone, {
+  // The radio gateway is not a device: only people are listed.
+  assert.equal(d.devices.length, 1);
+  assert.deepEqual(d.devices[0], {
     device_id: 'device-phone-0001', name: '=Mom', role: 'browser', kind: 'phone',
     talk_ms: 10000, transmissions: 1, connected_ms: 11 * MIN, sessions: 1, drops: 1,
   });
+  assert.equal(d.transmissions.filter((t) => t.origin === 'radio').length, 5);
+  assert.equal(d.transmissions.find((t) => t.id === 't2').origin, 'online');
+
+  // The gateway has its own summary: connected 08:00 to 21:00 of the 24 hours.
+  assert.equal(d.gateway.known, true);
+  assert.equal(d.gateway.sessions, 1);
+  assert.equal(d.gateway.connected_ms, 13 * 60 * MIN);
+  assert.equal(d.gateway.uptime_pct, 54.2);
+  assert.deepEqual(d.gateway.outages.map((o) => [o.reason, o.back_at]), [['closed', null]]);
 
   assert.deepEqual(d.conversations.map((c) => [c.turns, c.talk_ms, c.participants.length]), [[3, 70000, 2], [2, 76000, 1], [1, 5000, 1]]);
+  assert.deepEqual(d.conversations.map((c) => c.kind), ['mixed', 'radio', 'radio']);
   assert.equal(d.transmissions.length, 6);
   assert.equal(d.transmissions[5].end_reason, 'timeout');
   assert.equal(d.sessions.length, 3);
   assert.ok(!('recording_path' in d.transmissions[0]), 'file paths on the server are not exposed');
+});
+
+test('range: the gateway is not a person; its drop, the call the radio missed and the listener show up', { skip }, async () => {
+  const d = (await get(open, `/api/admin/range?from=${DAY2}&to=${DAY2 + 24 * 60 * MIN}`)).json;
+  const at2 = (minutes, seconds = 0) => DAY2 + 8 * 60 * MIN + minutes * MIN + seconds * 1000;
+  assert.equal(d.totals.transmissions, 4);
+  assert.deepEqual(d.totals.online, { sessions: 2, drops: 0, talk_ms: 18000, transmissions: 2 });
+  assert.equal(d.totals.drops, 0, 'the gateway drop is not a people drop');
+  assert.deepEqual(d.devices.map((x) => x.name).sort(), ['Dad', 'Mom']);
+  assert.equal(d.gateway.sessions, 2);
+  assert.equal(d.gateway.drops, 1);
+  assert.deepEqual(d.gateway.outages[0], { left_at: at2(60), reason: 'dead-connection', connected_for_ms: 60 * MIN, down_ms: 2 * MIN, back_at: at2(62) });
+  assert.equal(d.gateway.outages.length, 2);
+  assert.equal(d.gateway.drops, 1, 'a clean stop is an outage, not a drop');
+  // only u3 (spoken while the gateway was cut off) was lost; u1 was fine
+  assert.deepEqual(d.gateway.missed.map((m) => m.id), ['u3']);
+  assert.equal(d.totals.missed_by_radio, 1);
+  assert.equal(d.totals.radio.unmonitored, 1, 'radio talk with nobody on the app is counted, not flagged');
+
+  const [first, second] = d.conversations;
+  assert.equal(first.kind, 'mixed');
+  assert.deepEqual(first.listeners.map((l) => l.name), ['Dad'], 'Dad only listened; Mom talked so is not a listener');
+  assert.equal(second.kind, 'online');
+  assert.equal(d.conversations[2].kind, 'radio');
 });
 
 test('range: only what falls inside it; connection time is clipped to it', { skip }, async () => {
@@ -185,6 +239,7 @@ test('range: only what falls inside it; connection time is clipped to it', { ski
   assert.deepEqual(d.transmissions.map((t) => t.id), ['t2', 't3']);
   assert.equal(d.sessions.length, 2, 'both were connected during the range');
   for (const dev of d.devices) assert.equal(dev.connected_ms, 75000);
+  assert.equal(d.gateway.connected_ms, 75000, 'the gateway is clipped to the range too');
 });
 
 test('range: an empty day is an answer, not an error', { skip }, async () => {
@@ -210,11 +265,11 @@ test('devices: everyone ever seen, with all-time totals', { skip }, async () => 
   const d = (await get(open, '/api/admin/devices')).json;
   const radio = d.devices.find((x) => x.id === 'cli-gateway0001');
   assert.equal(radio.kind, 'gateway');
-  assert.equal(radio.transmissions, 5);
-  assert.equal(radio.talk_ms, 141000);
+  assert.equal(radio.transmissions, 7);
+  assert.equal(radio.talk_ms, 191000);
   const phone = d.devices.find((x) => x.id === 'device-phone-0001');
   assert.equal(phone.drops, 1);
-  assert.equal(phone.sessions, 1);
+  assert.equal(phone.sessions, 2);
 });
 
 test('export: CSV of either table for the range; anything else is refused', { skip }, async () => {
@@ -426,14 +481,18 @@ function sampleRange(url) {
   ];
   return {
     from, to, now: to + 1000, truncated: false, conversation_gap_s: 60,
-    totals: { talk_ms: 77000, transmissions: 3, longest: { id: 't3', name: 'Radio', started_at: start + 300000, held_ms: 47000 }, sessions: 2, drops: 1, unheard_gateway: 1, unheard_gateway_ms: 47000 },
+    totals: { talk_ms: 77000, transmissions: 3, longest: { id: 't3', name: 'Radio', started_at: start + 300000, held_ms: 47000 }, sessions: 1, drops: 1, online: { sessions: 1, drops: 1, talk_ms: 10000, transmissions: 1 }, radio: { transmissions: 2, talk_ms: 67000, unmonitored: 1, unmonitored_ms: 47000 }, missed_by_radio: 1, missed_by_radio_ms: 10000 },
+    gateway: {
+      known: true, sessions: 2, drops: 1, connected_ms: 3000000, down_ms: 600000, uptime_pct: 83.3, first_joined_at: start - 59000,
+      outages: [{ left_at: start + 50000, reason: 'dead-connection', connected_for_ms: 600000, down_ms: 120000, back_at: start + 170000 }],
+      missed: [{ id: 't2', name: 'phone', started_at: start + 30000, held_ms: 10000 }],
+    },
     devices: [
-      { device_id: 'radio', name: 'Radio', role: 'gateway', kind: 'gateway', talk_ms: 67000, transmissions: 2, connected_ms: 3600000, sessions: 1, drops: 0 },
       { device_id: 'phone', name: hostile, role: 'browser', kind: 'phone', talk_ms: 10000, transmissions: 1, connected_ms: 600000, sessions: 1, drops: 1 },
     ],
     conversations: [
-      { started_at: start, ended_at: start + 40000, length_ms: 40000, turns: 2, talk_ms: 30000, participants: [{ name: 'Radio', turns: 1, talk_ms: 20000 }, { name: hostile, turns: 1, talk_ms: 10000 }] },
-      { started_at: start + 300000, ended_at: start + 347000, length_ms: 47000, turns: 1, talk_ms: 47000, participants: [{ name: 'Radio', turns: 1, talk_ms: 47000 }] },
+      { started_at: start, ended_at: start + 40000, length_ms: 40000, turns: 2, talk_ms: 30000, kind: 'mixed', listeners: [{ name: 'Dad' }], participants: [{ name: 'Radio', role: 'gateway', turns: 1, talk_ms: 20000 }, { name: hostile, role: 'browser', turns: 1, talk_ms: 10000 }] },
+      { started_at: start + 300000, ended_at: start + 347000, length_ms: 47000, turns: 1, talk_ms: 47000, kind: 'radio', listeners: [], participants: [{ name: 'Radio', role: 'gateway', turns: 1, talk_ms: 47000 }] },
     ],
     transmissions,
     sessions: [
@@ -452,16 +511,20 @@ test('admin.js draws the day: tiles, tables, both charts, and text from peers st
   assert.ok(page.requests.every((r) => !r.headers.Authorization), 'no token was set, none must be sent');
 
   const tiles = page.$('tiles').textContent;
-  for (const piece of ['Minutes talked', '1.3', 'Transmissions', '3', '2 conversations', 'Longest', '47 s', 'Busiest hour', '12:00', '1 dropped', 'Radio unheard']) {
+  for (const piece of ['Minutes talked', '1.3', 'Transmissions', '3', '2 conversations', 'Longest', '47 s', 'Busiest hour', '12:00', '1 dropped', 'People connections', 'Missed by radio', '10 s spoken while the gateway was down']) {
     assert.ok(tiles.includes(piece), `tiles are missing "${piece}": ${tiles}`);
   }
 
   const rowsOf = (id) => page.$(id).all((n) => n.tag === 'tr').length - 1; // minus the header row
   assert.equal(rowsOf('talk-table'), 3);
   assert.equal(rowsOf('conversations-table'), 2);
-  assert.equal(rowsOf('devices-table'), 2);
-  assert.equal(rowsOf('unheard-table'), 1, 'only the gateway call nobody heard; the phone talking to nobody is not a radio call');
-  assert.ok(page.$('talk-table').textContent.includes('nobody'));
+  assert.equal(rowsOf('devices-table'), 1, 'people only: the radio gateway is not a device');
+  assert.equal(rowsOf('missed-table'), 1, 'the call from the app that the radio never got');
+  assert.equal(rowsOf('outages-table'), 1);
+  assert.ok(page.$('gateway-tiles').textContent.includes('83.3%'));
+  assert.ok(page.$('conversations-table').textContent.includes('Radio and app'));
+  assert.ok(page.$('conversations-table').textContent.includes('Dad'), 'listeners are named');
+  assert.ok(page.$('talk-table').textContent.includes('nobody listening'));
   assert.ok(page.$('talk-table').textContent.includes('Time limit'));
 
   // 30 bars, today's selected, each with a hit area that names the day.
@@ -477,6 +540,8 @@ test('admin.js draws the day: tiles, tables, both charts, and text from peers st
   assert.equal(timeline.all((n) => n.has('row-label')).length, 2);
   assert.equal(timeline.all((n) => n.has('session')).length, 2);
   assert.equal(timeline.all((n) => n.has('drop-cap')).length, 1);
+  assert.equal(timeline.all((n) => n.has('drop')).length, 0, 'bars are not coloured by how they ended; only the end mark is');
+  assert.equal(timeline.all((n) => n.has('row-label') && n.textContent === 'Radio gateway').length, 1);
   assert.equal(timeline.all((n) => n.has('talk')).length, 3);
 
   // The hostile name is there, as text; nothing in the tree was built from markup.

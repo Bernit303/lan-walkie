@@ -200,20 +200,27 @@ function table(target, columns, rows, emptyText) {
   target.append(body);
 }
 
-const tag = (text, warn) => el('span', { text, class: warn ? 'tag warn' : 'tag' });
+const tag = (text, warn, kind) => el('span', { text, class: ['tag', warn ? 'warn' : '', kind || ''].join(' ').trim() });
 
 function renderTiles(data) {
   const t = data.totals;
   const busy = busiestHour(data.transmissions);
+  const online = t.online || { sessions: t.sessions, drops: t.drops, talk_ms: 0 };
+  const radio = t.radio || { transmissions: 0, talk_ms: 0 };
   const tiles = [
-    ['Minutes talked', fmtMinutes(t.talk_ms), fmtDuration(t.talk_ms)],
+    ['Minutes talked', fmtMinutes(t.talk_ms), `${fmtMinutes(online.talk_ms)} on the app, ${fmtMinutes(radio.talk_ms)} from the radio`],
     ['Transmissions', t.transmissions, `${data.conversations.length} conversation${data.conversations.length === 1 ? '' : 's'}`],
     ['Longest', t.longest ? fmtDuration(t.longest.held_ms) : 'None', t.longest ? `${t.longest.name || '?'} at ${fmtTime(t.longest.started_at)}` : ''],
     ['Busiest hour', busy ? `${pad2(busy.hour)}:00` : 'None', busy ? `${fmtDuration(busy.talk_ms)} of talk` : ''],
-    ['Connections', t.sessions, `${t.drops} dropped`],
-    ['Radio unheard', t.unheard_gateway, t.unheard_gateway ? fmtDuration(t.unheard_gateway_ms) : 'every call had a listener'],
+    ['People connections', t.sessions, `${t.drops} dropped`],
   ];
-  const target = $('tiles');
+  if (t.missed_by_radio !== null && t.missed_by_radio !== undefined) {
+    tiles.push(['Missed by radio', t.missed_by_radio, t.missed_by_radio ? `${fmtDuration(t.missed_by_radio_ms)} spoken while the gateway was down` : 'the gateway got every call']);
+  }
+  fillTiles($('tiles'), tiles);
+}
+
+function fillTiles(target, tiles) {
   clear(target);
   for (const [title, value, sub] of tiles) {
     const dd = el('dd', { text: value });
@@ -285,7 +292,7 @@ function renderTimeline(data) {
   for (const s of data.sessions) {
     if (!s.joined_at) continue;
     const key = s.device_id || `name:${s.name}`;
-    if (!rows.has(key)) rows.set(key, { name: s.name, sessions: [], talks: [] });
+    if (!rows.has(key)) rows.set(key, { name: s.name, gateway: s.role === 'gateway', sessions: [], talks: [] });
     const row = rows.get(key);
     row.name = s.name || row.name;
     row.sessions.push(s);
@@ -297,7 +304,7 @@ function renderTimeline(data) {
 
   const W = 720, labelW = 132, right = 10, top = 20, rowH = 24, bottom = 6;
   const plotW = W - labelW - right;
-  const list = [...rows.values()];
+  const list = [...rows.values()].sort((a, b) => Number(b.gateway) - Number(a.gateway)); // the radio gateway first
   const H = top + Math.max(1, list.length) * rowH + bottom;
   chart.setAttribute('viewBox', `0 0 ${W} ${H}`);
   const xOf = (ms) => labelW + ((Math.min(Math.max(ms, from), to) - from) / (to - from)) * plotW;
@@ -313,8 +320,9 @@ function renderTimeline(data) {
   }
   list.forEach((row, i) => {
     const y = top + i * rowH;
-    const name = String(row.name || '?');
-    chart.append(svg('text', { x: 4, y: y + 16, class: 'row-label' }, name.length > 17 ? `${name.slice(0, 16)}…` : name));
+    const name = row.gateway ? 'Radio gateway' : String(row.name || '?');
+    if (i > 0 && list[i - 1].gateway && !row.gateway) chart.append(svg('line', { x1: 0, x2: W - right, y1: y, y2: y, class: 'group-line' }));
+    chart.append(svg('text', { x: 4, y: y + 16, class: row.gateway ? 'row-label gateway' : 'row-label' }, name.length > 17 ? `${name.slice(0, 16)}…` : name));
     for (const s of row.sessions) {
       const stillOn = s.left_at === null;
       const x1 = xOf(s.connected_at);
@@ -324,7 +332,7 @@ function renderTimeline(data) {
       const how = stillOn ? 'still connected' : `ended ${fmtTime(s.left_at)} (${LEAVE_REASONS[s.leave_reason] || s.leave_reason || 'closed'})`;
       const label = `${name}: connected ${fmtTime(s.connected_at)}, ${how}, ${fmtDuration((stillOn ? data.now : s.left_at) - s.connected_at)}`;
       chart.append(hitArea({ x: x1 - 2, y: y + 2, width: width + 4, height: rowH - 4 }, label, readout));
-      chart.append(svg('rect', { x: x1, y: y + 7, width, height: 10, rx: 3, class: dropped ? 'session drop' : 'session' }));
+      chart.append(svg('rect', { x: x1, y: y + 7, width, height: 10, rx: 3, class: 'session' }));
       // A drop is marked by shape as well as colour: a tall cap where it ended.
       if (dropped) chart.append(svg('rect', { x: x1 + width - 1, y: y + 3, width: 3, height: 18, rx: 1, class: 'drop-cap' }));
     }
@@ -340,25 +348,55 @@ function renderTimeline(data) {
   }
 }
 
-function renderTables(data) {
-  const unheard = data.transmissions.filter((t) => t.role === 'gateway' && t.listeners_audible === 0);
-  $('unheard-summary').textContent = unheard.length
-    ? `${unheard.length} call${unheard.length === 1 ? '' : 's'}, ${fmtDuration(data.totals.unheard_gateway_ms)} in all. Nobody had the app on screen (or playing in the background) when these started.`
+const KIND_LABELS = { radio: 'Radio only', online: 'App only', mixed: 'Radio and app' };
+
+function names(list) {
+  return list.map((p) => p.name || '?').join(', ');
+}
+
+function renderGateway(data) {
+  const g = data.gateway || { known: false, outages: [], missed: [] };
+  const r = (data.totals && data.totals.radio) || { transmissions: 0, talk_ms: 0, unmonitored: 0, unmonitored_ms: 0 };
+  if (!g.known) {
+    fillTiles($('gateway-tiles'), [['Radio gateway', 'Never seen', 'it has not connected to this server']]);
+  } else {
+    fillTiles($('gateway-tiles'), [
+      ['Connected', g.uptime_pct === null ? 'n/a' : `${g.uptime_pct}%`, `${fmtDuration(g.connected_ms)} of the day, down ${fmtDuration(g.down_ms)}`],
+      ['Cut off', g.drops, g.drops ? 'dropped by the server' : 'no drops'],
+      ['Radio talk', fmtMinutes(r.talk_ms), `${r.transmissions} transmission${r.transmissions === 1 ? '' : 's'}`],
+      ['With nobody on the app', r.unmonitored, r.unmonitored ? `${fmtDuration(r.unmonitored_ms)}, normal: the radio side heard it` : 'someone on the app was listening every time'],
+    ]);
+  }
+  table($('outages-table'), [
+    { title: 'Cut off at', value: (o) => fmtTime(o.left_at) },
+    { title: 'Why', value: (o) => (o.reason === 'dead-connection' ? tag('Dropped', true) : LEAVE_REASONS[o.reason] || o.reason || 'Closed') },
+    { title: 'Had been connected', num: true, value: (o) => fmtDuration(o.connected_for_ms) },
+    { title: 'Back after', num: true, value: (o) => (o.back_at === null ? 'not yet' : fmtDuration(o.down_ms)) },
+  ], g.outages || [], g.known ? 'The gateway was never cut off on this day.' : 'No gateway on record.');
+
+  const missed = g.missed || [];
+  $('missed-summary').textContent = missed.length
+    ? `${missed.length} call${missed.length === 1 ? '' : 's'}, ${fmtDuration(missed.reduce((n, m) => n + m.held_ms, 0))} in all. The radio could not hear these.`
     : '';
-  table($('unheard-table'), [
+  table($('missed-table'), [
     { title: 'Start', value: (t) => fmtTime(t.started_at) },
     { title: 'From', value: (t) => t.name },
     { title: 'Length', num: true, value: (t) => fmtDuration(t.held_ms) },
-    { title: 'Connected but not listening', num: true, value: (t) => t.listeners },
-  ], unheard, 'None. Every radio call had someone listening.');
+  ], missed, g.known ? 'None. The gateway was connected for every call.' : 'No gateway on record.');
+}
 
-  $('conversations-summary').textContent = `Transmissions less than ${data.conversation_gap_s} s apart count as one conversation.`;
+function renderTables(data) {
+  renderGateway(data);
+
+  $('conversations-summary').textContent = `Transmissions less than ${data.conversation_gap_s} s apart count as one conversation. "Radio" is everyone on the radio side.`;
   table($('conversations-table'), [
     { title: 'Start', value: (c) => fmtTime(c.started_at) },
+    { title: 'Between', value: (c) => tag(KIND_LABELS[c.kind] || '', false, c.kind) },
     { title: 'Length', num: true, value: (c) => fmtDuration(c.length_ms) },
     { title: 'Turns', num: true, value: (c) => c.turns },
     { title: 'Talk time', num: true, value: (c) => fmtDuration(c.talk_ms) },
-    { title: 'Who', wrap: true, value: (c) => c.participants.map((p) => `${p.name || '?'} (${p.turns}, ${fmtDuration(p.talk_ms)})`).join(', ') },
+    { title: 'Who talked', wrap: true, value: (c) => c.participants.map((p) => `${p.role === 'gateway' ? 'Radio' : p.name || '?'} (${p.turns}, ${fmtDuration(p.talk_ms)})`).join(', ') },
+    { title: 'Also listening', wrap: true, value: (c) => (c.listeners && c.listeners.length ? names(c.listeners) : 'nobody else') },
   ], data.conversations, 'Nobody talked on this day.');
 
   table($('devices-table'), [
@@ -369,14 +407,15 @@ function renderTables(data) {
     { title: 'Connected', num: true, value: (d) => fmtDuration(d.connected_ms) },
     { title: 'Connections', num: true, value: (d) => d.sessions },
     { title: 'Dropped', num: true, value: (d) => (d.drops ? tag(String(d.drops), true) : '0') },
-  ], data.devices, 'No devices on this day.');
+  ], data.devices, 'No people on this day.');
 
   table($('talk-table'), [
     { title: 'Start', value: (t) => fmtTime(t.started_at) },
-    { title: 'Who', value: (t) => `${t.priority ? '⭐ ' : ''}${t.name || '?'}` },
+    { title: 'From', value: (t) => (t.role === 'gateway' ? tag('Radio', false, 'radio') : `${t.priority ? '⭐ ' : ''}${t.name || '?'}`) },
     { title: 'Length', num: true, value: (t) => fmtDuration(t.held_ms) },
     { title: 'Ended', value: (t) => (t.live ? tag('talking now') : END_REASONS[t.end_reason] || t.end_reason || '') },
-    { title: 'Could hear it', num: true, value: (t) => (t.listeners_audible === 0 ? tag('nobody', true) : `${t.listeners_audible} of ${t.listeners}`) },
+    // Radio traffic with nobody on the app is normal; only the app side can be "nobody listening".
+    { title: 'On the app', num: true, value: (t) => (t.listeners_audible === 0 ? tag('nobody listening') : `${t.listeners_audible} of ${t.listeners} listening`) },
   ], data.transmissions, 'Nobody talked on this day.');
 }
 

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changed
+- Usage page: the radio gateway is no longer treated as one more person. It stands for
+  everyone on the radio side, so it has its own section (time connected, each time it was cut
+  off and how long it took to come back, and calls from the app that the radio never got).
+  Connections, drops and the per-device table now count people only. Conversations are
+  labelled radio only, app only or radio and app, and name the people who were connected and
+  listening. A radio call with nobody on the app is no longer a "call nobody could hear": it
+  is normal, shown as a count. The connections timeline no longer colours a whole bar red for
+  how it ended; only the tall mark at its end shows a drop, and the gateway is the top row.
+  The API `range` response gains `totals.online`, `totals.radio`, `totals.missed_by_radio`,
+  `gateway`, per-transmission `origin`, and per-conversation `kind` and `listeners`;
+  `totals.unheard_gateway` is gone.
+
 ### Added
 - Browser: the app keeps the phone screen on (Screen Wake Lock API). A screen that locks hides
   the page, which mutes received audio and gets the phone dropped as `dead-connection`; this
