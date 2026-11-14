@@ -56,6 +56,30 @@ Gst.init(None)
 AIOC_USB_VID = 0x1209  # per the AIOC firmware-update docs (dfu-util -d 1209:7388)
 AIOC_USB_PID = 0x7388
 MAX_SIGNALING_BYTES = 256 * 1024  # SDP is a few KB; far above that is not signaling
+
+# Staying connected over a link that stalls now and then (the gateway can sit
+# behind a different internet connection than the server). The WebSocket
+# library defaults waited 20 s between pings, 20 s for an answer and 10 s for a
+# connect, and the retry delay doubled up to 30 s, so a 10 s outage cost about
+# a minute. Now:
+#   - ping every 5 s: also keeps the link probed, so a stalled TCP connection
+#     recovers within seconds of the network coming back;
+#   - give up on a silent connection after 25 s (the server waits 45 s for a
+#     gateway, see GATEWAY_GRACE_MS in server.js, so it never gives up first);
+#   - a connect attempt that hears nothing is abandoned after 6 s;
+#   - retry after 1, 2, 4 s and then every 5 s, for as long as it takes.
+WS_PING_INTERVAL_S = 5
+WS_PING_TIMEOUT_S = 25
+WS_OPEN_TIMEOUT_S = 6
+RECONNECT_FIRST_S = 1
+RECONNECT_MAX_S = 5
+
+
+def next_reconnect_delay(delay):
+    """The delay after `delay` seconds of waiting: doubles, up to RECONNECT_MAX_S."""
+    return min(delay * 2, RECONNECT_MAX_S)
+
+
 LEVEL_INTERVAL_NS = 20_000_000  # 20 ms level reports for VOX
 # Roger beep: a MOTOTRBO-style talk-permit warble, four back-to-back notes
 # (G6 C6 G6 E6, 200 ms). Same notes as BEEP_PATTERN in public/app.js; change
@@ -1570,11 +1594,18 @@ class WalkieClient:
         # all just look like the connection dropping. Reconnect with backoff
         # instead of exiting.
         async def connection_loop():
-            backoff = 1
+            backoff = RECONNECT_FIRST_S
             while True:
                 try:
                     print(f"Connecting to {self.url} as {safe_text(self.name)!r}...")
-                    async with websockets.connect(self.url, ssl=ssl_ctx, max_size=MAX_SIGNALING_BYTES) as ws:
+                    async with websockets.connect(
+                        self.url,
+                        ssl=ssl_ctx,
+                        max_size=MAX_SIGNALING_BYTES,
+                        ping_interval=WS_PING_INTERVAL_S,
+                        ping_timeout=WS_PING_TIMEOUT_S,
+                        open_timeout=WS_OPEN_TIMEOUT_S,
+                    ) as ws:
                         self.verified = self.check_server_identity(ws)
                         if self.token and not self.verified:
                             print(
@@ -1583,7 +1614,7 @@ class WalkieClient:
                                 file=sys.stderr,
                             )
                         self.ws = ws
-                        backoff = 1
+                        backoff = RECONNECT_FIRST_S
                         print("[connected]")
                         await self._recv_loop()
                 except Exception as e:
@@ -1594,7 +1625,7 @@ class WalkieClient:
                 self.reset_for_reconnect()
                 print(f"[disconnected — retrying in {backoff}s]", file=sys.stderr)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                backoff = next_reconnect_delay(backoff)
 
         try:
             conn_task = asyncio.create_task(connection_loop())

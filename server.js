@@ -372,6 +372,53 @@ function broadcastPeerList() {
   }
 }
 
+// The radio gateway usually sits at another site, behind its own internet
+// connection, so it comes and goes in ways a phone does not. Two things follow.
+//
+// 1. It gets more patience before it is called dead (GATEWAY_GRACE_MS), because
+//    a link that stalls for 20 seconds and then recovers should not cost a
+//    reconnect and a new WebRTC set-up with every phone.
+// 2. Browsers are told how the radio is doing (`radio` message), because
+//    otherwise someone talking into a radio that cannot hear them has no way to
+//    know.
+//
+//   none      no gateway has been seen lately, so there is nothing to report
+//   online    connected and answering
+//   unstable  connected, but silent for longer than a normal check
+//   offline   one was seen, but none is connected now
+const GATEWAY_GRACE_MS = Math.max(HEARTBEAT_MS * 2, Number(process.env.GATEWAY_GRACE_MS) || 45000);
+const RADIO_UNSTABLE_MS = Math.round(HEARTBEAT_MS * 1.5);
+const GATEWAY_SEEN_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+let gatewaySeen = (() => {
+  const ts = store.lastGatewaySeen();
+  return ts !== null && Date.now() - ts < GATEWAY_SEEN_WINDOW_MS;
+})();
+
+function radioStateAt(now) {
+  let quietest = null; // the least silent connected gateway
+  for (const c of clients.values()) {
+    if (!c.joined || c.role !== 'gateway') continue;
+    const silent = now - Math.max(c.lastPong, c.lastMsg);
+    if (quietest === null || silent < quietest) quietest = silent;
+  }
+  if (quietest !== null) return quietest > RADIO_UNSTABLE_MS ? 'unstable' : 'online';
+  return gatewaySeen ? 'offline' : 'none';
+}
+
+let radioState = radioStateAt(Date.now());
+
+function updateRadioState(now = Date.now()) {
+  const next = radioStateAt(now);
+  if (next === radioState) return;
+  const from = radioState;
+  radioState = next;
+  log.info('radio-state', { state: next, from });
+  store.event('radio-state', null, { state: next, from });
+  for (const c of clients.values()) {
+    if (c.joined && c.role === 'browser') send(c.ws, { type: 'radio', state: next });
+  }
+}
+
 wss.on('connection', (ws, req) => {
   if (clients.size >= MAX_CLIENTS) {
     // Without a listener, a bad frame sent while this socket is closing
@@ -437,7 +484,26 @@ wss.on('connection', (ws, req) => {
       me.role = roleFor(msg.role, req.headers.origin);
       store.sessionJoin({ connId: id, deviceId: me.device, name: me.name, role: me.role, ua: req.headers['user-agent'] });
       store.event('join', id, { name: me.name, device: me.device, role: me.role, priority: me.priority, again, clients: joinedCount() });
+      if (me.role === 'gateway') {
+        gatewaySeen = true;
+        // A gateway that comes back on a new connection while the server still
+        // holds the old one (it has not been judged dead yet) replaces it at
+        // once, instead of leaving a second "Radio" in everyone's list.
+        for (const [otherId, other] of clients) {
+          if (otherId === id || other.role !== 'gateway' || other.device !== me.device) continue;
+          other.endReason = 'replaced';
+          log.info('gateway-replaced', {
+            id: shortId(otherId), by_id: shortId(id), name: other.name,
+            silent_s: Math.round((Date.now() - Math.max(other.lastPong, other.lastMsg)) / 1000),
+          });
+          store.event('gateway-replaced', otherId, { by: id });
+          other.ws.terminate();
+        }
+      }
       broadcastPeerList();
+      // Tell this browser how the radio is doing now; later changes are broadcast.
+      updateRadioState();
+      if (me.role === 'browser' && radioState !== 'none') send(ws, { type: 'radio', state: radioState });
       // A late joiner (e.g. the gateway reconnecting) must learn who is talking
       // now; otherwise it stays unaware until the next floor change. Sent only
       // while the floor is held, and without re-granting or re-arming the timer.
@@ -592,6 +658,7 @@ wss.on('connection', (ws, req) => {
     clients.delete(id);
     releaseFloorIfHeldBy(id, 'disconnect', me);
     broadcastPeerList();
+    updateRadioState();
     log.info('leave', {
       id: shortId(id), name: me.joined ? me.name : undefined, joined: me.joined,
       reason: me.endReason || 'closed', code, duration_s: Math.round((Date.now() - me.connectedAt) / 1000), clients: clients.size,
@@ -630,7 +697,11 @@ const heartbeat = setInterval(() => {
     // Browsers ping at the application level, so judge them on that;
     // everyone else on protocol-level pongs.
     if (!c.appPing && !c.alive) c.missedPongs += 1;
-    const stale = c.appPing ? now - c.lastMsg > 2 * HEARTBEAT_MS + 1000 : c.missedPongs >= MISSED_PONGS_LIMIT;
+    let stale;
+    if (c.appPing) stale = now - c.lastMsg > 2 * HEARTBEAT_MS + 1000;
+    // The radio gateway is judged on time, with far more patience (see GATEWAY_GRACE_MS).
+    else if (c.joined && c.role === 'gateway') stale = now - Math.max(c.lastPong, c.lastMsg) > GATEWAY_GRACE_MS;
+    else stale = c.missedPongs >= MISSED_PONGS_LIMIT;
     if (stale) {
       const detail = {
         name: c.joined ? c.name : undefined,
@@ -647,6 +718,7 @@ const heartbeat = setInterval(() => {
     c.alive = false;
     try { c.ws.ping(); } catch { /* socket already going away */ }
   }
+  updateRadioState(now);
 }, HEARTBEAT_MS);
 heartbeat.unref();
 
@@ -660,6 +732,7 @@ server.listen(PORT, '0.0.0.0', () => {
     max_clients: MAX_CLIENTS,
     max_transmit_ms: MAX_TRANSMIT_MS,
     heartbeat_ms: HEARTBEAT_MS,
+    gateway_grace_ms: GATEWAY_GRACE_MS,
     priority: PRIORITY_TOKEN ? 'enabled' : 'disabled',
     roger_beep: ROGER_BEEP ? 'on' : 'off',
     allowed_origins: ALLOWED_ORIGINS.length,

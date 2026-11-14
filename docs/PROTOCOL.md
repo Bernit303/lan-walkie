@@ -58,7 +58,12 @@ Client's first message, right after `welcome`.
   or invalid: `browser` if the connection has an `Origin` header, else `cli`.
 
 Neither field changes what a client may do. Older clients that send neither
-keep working.
+keep working. The one thing `role: "gateway"` does change is how it is treated
+when its link is poor: it gets far more time before it is dropped as dead
+(`GATEWAY_GRACE_MS`, 45 s by default, against about 10 s for everyone else), it
+replaces an older connection of the same `device` the moment it joins, and
+browsers are told when it is unstable or gone (see `radio`). A gateway that
+sends no role is treated like any other CLI client and none of this applies.
 
 Triggers a `peers` broadcast to every joined client.
 
@@ -97,6 +102,30 @@ name, or disconnects). Each client gets everyone *except themselves*.
 
 Receiving this is what triggers WebRTC connection setup — see "Mesh setup"
 below.
+
+### `radio` (server → browsers)
+
+```json
+{ "type": "radio", "state": "offline" }
+```
+
+How the radio gateway is doing, so nobody keeps talking into a radio that
+cannot hear them. Sent only to joined clients with `role: "browser"`: once
+right after they join (unless the state is `none`), and again on every change.
+
+- `online` — a gateway is connected and answering.
+- `unstable` — connected, but it has not answered for longer than 1.5 heartbeats
+  (7.5 s by default). It may recover; if not it is dropped after
+  `GATEWAY_GRACE_MS` and the state becomes `offline`.
+- `offline` — a gateway was seen (in the last 7 days, remembered across server
+  restarts when the usage database is on) but none is connected now.
+- `none` — no gateway has been seen: there is no radio on this channel, so
+  nothing is sent.
+
+A client shows a warning for `unstable` and `offline` and nothing otherwise.
+Any other value (an unknown state from a newer server) is treated as `none`.
+The browser clears the warning while its own connection is down. Older clients
+ignore the message.
 
 ## Mesh setup (WebRTC signaling relay)
 

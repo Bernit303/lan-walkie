@@ -1440,5 +1440,27 @@ class SquelchTests(unittest.TestCase):
         self.assertFalse(c._open_warned)
 
 
+class ReconnectTests(unittest.TestCase):
+    def test_retry_delay_doubles_and_stops_at_the_cap(self):
+        delays = [cli.RECONNECT_FIRST_S]
+        for _ in range(6):
+            delays.append(cli.next_reconnect_delay(delays[-1]))
+        self.assertEqual(delays, [1, 2, 4, 5, 5, 5, 5])
+
+    def test_a_long_outage_never_waits_longer_than_the_cap_between_tries(self):
+        delay = cli.RECONNECT_FIRST_S
+        for _ in range(50):
+            delay = cli.next_reconnect_delay(delay)
+            self.assertLessEqual(delay, cli.RECONNECT_MAX_S)
+
+    def test_the_client_gives_up_on_a_silent_link_before_the_server_does(self):
+        # server.js drops a gateway after GATEWAY_GRACE_MS (45 s by default). If the
+        # client waited longer it would sit on a connection the server already closed.
+        self.assertLess(cli.WS_PING_INTERVAL_S + cli.WS_PING_TIMEOUT_S, 45)
+
+    def test_a_connect_attempt_is_abandoned_quickly(self):
+        self.assertLessEqual(cli.WS_OPEN_TIMEOUT_S, 10)
+
+
 if __name__ == "__main__":
     unittest.main()

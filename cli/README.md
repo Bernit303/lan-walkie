@@ -222,8 +222,14 @@ systemctl show lan-walkie-gateway -p MemoryCurrent   # resident memory, for a so
 
 What the unit does:
 
-- **`Restart=always`:** the client reconnects to the server by itself with
-  backoff; systemd only covers a crash (including one that exits 0).
+- **`Restart=always`:** the client reconnects to the server by itself (retrying
+  after 1, 2, 4 and then every 5 seconds, for as long as it takes); systemd only
+  covers a crash (including one that exits 0). A link that goes quiet is noticed
+  after about 30 seconds, and the server waits 45 seconds before it calls a
+  gateway dead, so a stall shorter than that does not cut the connection at all.
+  Start the gateway with the current script: the server only gives it that
+  patience, and tells phones when the radio is offline, if it joins as a
+  `gateway`.
 - **`KillSignal=SIGINT`:** a stop is handled like Ctrl+C, so the radio is
   unkeyed and the serial port closed before the process ends.
 - **`MemoryMax=300M`:** normal use is about 60 MB; a runaway process is killed

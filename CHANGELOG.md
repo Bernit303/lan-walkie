@@ -2,11 +2,35 @@
 
 ## Unreleased
 
+### Added
+- Browser: a "Radio offline. Nobody on the radio can hear you." banner under the status line
+  when the radio gateway is gone, and "Radio link unstable. The radio may miss what you say."
+  when it has stopped answering but may recover. Until now a phone talked into a radio that
+  could not hear it and nothing said so. The banner clears when the radio is back, and while
+  the phone itself is reconnecting.
+- Server: new `radio` message to browsers with the gateway's state (`online`, `unstable`,
+  `offline`; nothing when no gateway has been seen in 7 days). Sent on join and on every
+  change, remembered across restarts when the usage database is on. Logged as `radio-state`.
+  Needs the gateway to join with `role: "gateway"` (the current CLI does; an older one is
+  treated as a plain CLI client and no banner appears).
+- Server: `GATEWAY_GRACE_MS` (default 45 000). The radio gateway is dropped as dead only after
+  that long without an answer, instead of after two missed checks (about 10 s), and it replaces
+  its own stale old connection the moment it reconnects (`gateway-replaced`, leave reason
+  `replaced`). The gateway sits behind another internet connection than the server and that one
+  stalls for 10 to 60 s at times, which cut it about 60 times in 11 hours on 2026-11-13/14 and
+  cost a reconnect and a new WebRTC set-up with every phone each time.
+
+### Changed
+- Radio gateway (CLI): reconnects faster. It pings every 5 s (was 20), gives up on a silent
+  connection after 25 s (was 20 s after the next ping), abandons a connect attempt after 6 s
+  (was 10) and retries after 1, 2, 4 and then every 5 s (was up to 30 s). A 10 s outage used to
+  cost about a minute.
+
 ### Fixed
 - Server: a client that is judged on protocol pings (the CLI and the radio gateway) was dropped
   after a single missed check, about 5 to 10 seconds. A short stall of the host's disk or of
   the network was enough to cut a healthy gateway. It now takes `MISSED_PONGS_LIMIT` (default 2)
-  missed checks in a row. A check that itself runs late (the server was stalled) judges nobody
+  missed checks in a row (the gateway has its own, longer limit, `GATEWAY_GRACE_MS`, above). A check that itself runs late (the server was stalled) judges nobody
   and is logged as `event-loop-lag`. The `dead-connection` line gains `since_pong_s`.
 - Docker: `init: true`, so the zombie `ssl_client` processes the healthcheck's `wget` left
   behind are cleaned up.

@@ -1015,3 +1015,200 @@ test('the first start writes a backup of the database', { skip: noSqlite }, asyn
   assert.equal(files && files.length, 1);
   assert.ok(has(0, ' INFO  store-maintenance ', 'backup="walkie-'));
 });
+
+// ---------------------------------------------------------------------------
+// The radio gateway: patience with a flaky link, and telling browsers how the radio is doing.
+// ---------------------------------------------------------------------------
+
+// A client with a role and device id. Its answers to protocol pings can be switched off and on
+// (`ws.answer`), to play a link that stalls and recovers.
+async function roleClient(p, name, { role, device, answer = true } = {}) {
+  const ws = new WebSocket(`wss://127.0.0.1:${p}`, {
+    rejectUnauthorized: false,
+    autoPong: false,
+    headers: role === 'browser' ? { Origin: 'https://test.local' } : {},
+  });
+  ws.msgs = [];
+  ws.answer = answer;
+  ws.on('ping', () => { if (ws.answer) ws.pong(); });
+  ws.on('message', (d) => ws.msgs.push(JSON.parse(d)));
+  await new Promise((resolve, reject) => { ws.on('open', resolve); ws.on('error', reject); });
+  ws.id = (await waitFor(() => last(ws, 'welcome'))).id;
+  send(ws, { type: 'join', name, role, device });
+  await sleep(100);
+  return ws;
+}
+
+const radioStates = (ws) => ws.msgs.filter((m) => m.type === 'radio').map((m) => m.state);
+// True if `wanted` appears in `seen` in this order, other entries allowed in between.
+const inOrder = (seen, wanted) => {
+  let i = 0;
+  for (const s of seen) if (s === wanted[i]) i += 1;
+  return i === wanted.length;
+};
+
+test('a radio gateway that stalls is given far more time than a normal client before it is dropped', async () => {
+  const s = await startServer({ GATEWAY_GRACE_MS: '2400' });
+  const socks = [];
+  try {
+    const gateway = await roleClient(s.port, 'Radio', { role: 'gateway', device: 'gw-grace-0001', answer: false });
+    const cli = await roleClient(s.port, 'Other', { role: 'cli', device: 'cli-grace-0001', answer: false });
+    socks.push(gateway, cli);
+    const t0 = Date.now();
+    // A normal client that stops answering is gone after two missed checks.
+    await waitFor(() => cli.readyState === WebSocket.CLOSED, 2000);
+    assert.equal(cli.readyState, WebSocket.CLOSED, 'a normal client is dropped after two missed checks');
+    assert.equal(gateway.readyState, WebSocket.OPEN, 'the gateway is still held at the same moment');
+    // The gateway goes only after the grace period.
+    await waitFor(() => gateway.readyState === WebSocket.CLOSED, 4000);
+    assert.equal(gateway.readyState, WebSocket.CLOSED);
+    assert.ok(Date.now() - t0 >= 2000, `dropped after ${Date.now() - t0} ms, expected the grace period`);
+    assert.ok(s.out.includes('gateway_grace_ms=2400'));
+    assert.match(s.out, /dead-connection id="[0-9a-f]{8}" name="Radio" check="protocol-ping"/);
+  } finally {
+    for (const w of socks) w.terminate();
+    s.child.kill();
+  }
+});
+
+test('browsers are told how the radio is doing: online, unstable, online again, then offline, then back', async () => {
+  const s = await startServer({ HEARTBEAT_MS: '500', GATEWAY_GRACE_MS: '3000' });
+  const socks = [];
+  try {
+    const early = await roleClient(s.port, 'Early', { role: 'browser', device: 'browser-radio-001' });
+    socks.push(early);
+    await sleep(700);
+    assert.deepEqual(radioStates(early), [], 'with no gateway ever seen there is nothing to report');
+
+    const gateway = await roleClient(s.port, 'Radio', { role: 'gateway', device: 'gw-radio-0001' });
+    socks.push(gateway);
+    await waitFor(() => radioStates(early).includes('online'), 2000);
+    assert.equal(radioStates(early)[0], 'online');
+
+    // Someone who arrives later is told the current state when they join.
+    const late = await roleClient(s.port, 'Late', { role: 'browser', device: 'browser-radio-002' });
+    socks.push(late);
+    assert.deepEqual(radioStates(late), ['online']);
+
+    // Only browsers get it.
+    const cli = await roleClient(s.port, 'Headless', { role: 'cli', device: 'cli-radio-0001' });
+    socks.push(cli);
+
+    // The link stalls ...
+    gateway.answer = false;
+    await waitFor(() => radioStates(early).includes('unstable'), 3000);
+    assert.equal(radioStates(early).at(-1), 'unstable');
+    assert.equal(gateway.readyState, WebSocket.OPEN, 'unstable is a warning, not a drop');
+    // ... and recovers before the grace period ends: nobody was disconnected.
+    gateway.answer = true;
+    await waitFor(() => radioStates(early).at(-1) === 'online', 3000);
+    assert.equal(gateway.readyState, WebSocket.OPEN);
+
+    // Stalls for good: unstable, then offline once the gateway is dropped.
+    gateway.answer = false;
+    await waitFor(() => radioStates(early).at(-1) === 'offline', 8000);
+    assert.ok(inOrder(radioStates(early), ['online', 'unstable', 'online', 'unstable', 'offline']), radioStates(early).join(','));
+    assert.equal(radioStates(late).at(-1), 'offline');
+
+    // A new gateway brings it back.
+    const again = await roleClient(s.port, 'Radio', { role: 'gateway', device: 'gw-radio-0001' });
+    socks.push(again);
+    await waitFor(() => radioStates(early).at(-1) === 'online', 2000);
+
+    assert.deepEqual(radioStates(cli), [], 'the headless client is not sent radio news');
+    assert.deepEqual(radioStates(gateway), []);
+    assert.ok(s.out.includes(' INFO  radio-state ') && s.out.includes('state="offline"'));
+  } finally {
+    for (const w of socks) w.terminate();
+    s.child.kill();
+  }
+});
+
+test('a gateway that reconnects replaces its stale old connection at once, without the radio ever showing offline', async () => {
+  const s = await startServer({ HEARTBEAT_MS: '500', GATEWAY_GRACE_MS: '30000' });
+  const socks = [];
+  try {
+    const browser = await roleClient(s.port, 'Phone', { role: 'browser', device: 'browser-repl-0001' });
+    const old = await roleClient(s.port, 'Radio', { role: 'gateway', device: 'gw-repl-00001', answer: false });
+    socks.push(browser, old);
+    await waitFor(() => radioStates(browser).includes('online'), 2000);
+
+    const fresh = await roleClient(s.port, 'Radio', { role: 'gateway', device: 'gw-repl-00001' });
+    socks.push(fresh);
+    await waitFor(() => old.readyState === WebSocket.CLOSED, 1500);
+    assert.equal(old.readyState, WebSocket.CLOSED, 'the old connection must go as soon as its replacement joins');
+    assert.equal(fresh.readyState, WebSocket.OPEN);
+
+    await waitFor(() => last(browser, 'peers')?.peers.filter((p) => p.name === 'Radio').length === 1, 1500);
+    assert.equal(last(browser, 'peers').peers.filter((p) => p.name === 'Radio').length, 1, 'one Radio in the list, not two');
+    assert.ok(!radioStates(browser).includes('offline'), `the radio never went offline: ${radioStates(browser).join(',')}`);
+    await waitFor(() => s.out.includes('reason="replaced"'), 1500);
+    assert.match(s.out, / INFO {2}gateway-replaced id="[0-9a-f]{8}" by_id="[0-9a-f]{8}" name="Radio"/);
+    assert.match(s.out, /leave id="[0-9a-f]{8}" name="Radio" joined=true reason="replaced"/);
+  } finally {
+    for (const w of socks) w.terminate();
+    s.child.kill();
+  }
+});
+
+test('a different gateway device with the same name is not treated as a replacement', async () => {
+  const s = await startServer({ GATEWAY_GRACE_MS: '30000' });
+  const socks = [];
+  try {
+    const a = await roleClient(s.port, 'Radio', { role: 'gateway', device: 'gw-twin-a-0001' });
+    const b = await roleClient(s.port, 'Radio', { role: 'gateway', device: 'gw-twin-b-0001' });
+    socks.push(a, b);
+    await sleep(400);
+    assert.equal(a.readyState, WebSocket.OPEN);
+    assert.equal(b.readyState, WebSocket.OPEN);
+  } finally {
+    for (const w of socks) w.terminate();
+    s.child.kill();
+  }
+});
+
+test('a restarted server still says the radio is offline until the gateway is back', { skip: noSqlite }, async () => {
+  const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'walkie-test-radio-')), 'data');
+  const first = await startServer({ STATS: 'on', DATA_DIR: dir });
+  let gateway;
+  try {
+    gateway = await roleClient(first.port, 'Radio', { role: 'gateway', device: 'gw-restart-0001' });
+    await sleep(200);
+  } finally {
+    if (gateway) gateway.terminate();
+    await sleep(200);
+    first.child.kill();
+    await new Promise((resolve) => first.child.on('exit', resolve));
+  }
+
+  const second = await startServer({ STATS: 'on', DATA_DIR: dir });
+  const socks = [];
+  try {
+    const browser = await roleClient(second.port, 'Phone', { role: 'browser', device: 'browser-restart-01' });
+    socks.push(browser);
+    await waitFor(() => radioStates(browser).length > 0, 1500);
+    assert.deepEqual(radioStates(browser), ['offline']);
+    const back = await roleClient(second.port, 'Radio', { role: 'gateway', device: 'gw-restart-0001' });
+    socks.push(back);
+    await waitFor(() => radioStates(browser).at(-1) === 'online', 2000);
+  } finally {
+    for (const w of socks) w.terminate();
+    second.child.kill();
+  }
+});
+
+test('a server that never had a gateway says nothing about the radio, even with the database on', { skip: noSqlite }, async () => {
+  const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'walkie-test-noradio-')), 'data');
+  const s = await startServer({ STATS: 'on', DATA_DIR: dir });
+  const socks = [];
+  try {
+    const browser = await roleClient(s.port, 'Phone', { role: 'browser', device: 'browser-nogw-0001' });
+    const other = await roleClient(s.port, 'Other', { role: 'cli', device: 'cli-nogw-000001' });
+    socks.push(browser, other);
+    await sleep(800);
+    assert.deepEqual(radioStates(browser), []);
+  } finally {
+    for (const w of socks) w.terminate();
+    s.child.kill();
+  }
+});

@@ -33,7 +33,7 @@ caps them at 5 files of 10 MB.
 
 | Event | Fields | When |
 |---|---|---|
-| `config` | version, node, pid, port, max_clients, max_transmit_ms, heartbeat_ms, priority (`enabled`/`disabled`), roger_beep (`on`/`off`), allowed_origins (count), log_level, log_format, stats_ms | Once at startup: the settings the server is actually running with. |
+| `config` | version, node, pid, port, max_clients, max_transmit_ms, heartbeat_ms, gateway_grace_ms, priority (`enabled`/`disabled`), roger_beep (`on`/`off`), allowed_origins (count), log_level, log_format, stats_ms | Once at startup: the settings the server is actually running with. |
 | `listening` | url | The server is accepting connections. |
 | `cert-generate`, `cert-names` | covers | A new self-signed certificate is being created. |
 | `connect` | id, ip, origin, ua, clients | A WebSocket opened. `ua` is the browser/device. Behind Tailscale Serve `ip` is the proxy's address. |
@@ -42,7 +42,9 @@ caps them at 5 files of 10 MB.
 | `floor-released` | id, name, reason, held_ms | The channel was freed. `reason` is `ptt-stop` (let go) or `disconnect` (connection lost while talking). |
 | `floor-preempted` | by_id, by, from_id, from | A priority client took the channel from someone. Followed by `floor-granted`. |
 | `floor-denied` | id, name, holder_id, holder | Someone pressed Talk while another person was talking. Limited to one per second per client. |
-| `leave` | id, name, joined, reason, code, duration_s, clients | A connection ended. `reason` is `closed` (normal), `dead-connection`, `flood` or `socket-error`. |
+| `leave` | id, name, joined, reason, code, duration_s, clients | A connection ended. `reason` is `closed` (normal), `dead-connection`, `flood`, `socket-error` or `replaced` (a radio gateway reconnected and took over from its stale old connection). |
+| `radio-state` | state, from | How the radio gateway is doing changed: `online`, `unstable`, `offline` or `none`. Browsers are told at the same moment (`docs/PROTOCOL.md`). |
+| `gateway-replaced` | id, by_id, name, silent_s | A radio gateway joined on a new connection while the server still held an older one from the same device. The old one is closed at once. `silent_s` is how long it had been quiet. |
 | `tls-error` | ip, code | A browser refused the certificate, or something that is not TLS (a scanner, a plain `http://` request) hit the port. At most one per 5 s per address. |
 | `stats` | clients, joined, floor, uptime_s, rss_mb | Periodic summary, so a quiet log still shows the server is alive. |
 | `shutdown` | signal | Stopped by `SIGTERM`/`SIGINT` (e.g. `docker stop`). |
@@ -52,7 +54,7 @@ caps them at 5 files of 10 MB.
 | Event | Level | Fields | Meaning |
 |---|---|---|---|
 | `floor-timeout` | warn | id, name, held_ms, limit_ms | Someone held the channel for the whole `MAX_TRANSMIT_MS` without releasing (stuck button, frozen phone). |
-| `dead-connection` | warn | id, name, check, silent_s, since_pong_s | The server stopped hearing from a client and dropped it (phone left Wi-Fi, battery died). `check` is `app-ping` (browser) or `protocol-ping`. A protocol-ping client (the CLI, the radio gateway) is dropped after `MISSED_PONGS_LIMIT` (default 2) checks in a row with no answer. `silent_s` is the time since its last message of any kind (a quiet gateway has long silences that mean nothing); `since_pong_s` is the time since its last answer to a ping. |
+| `dead-connection` | warn | id, name, check, silent_s, since_pong_s | The server stopped hearing from a client and dropped it (phone left Wi-Fi, battery died). `check` is `app-ping` (browser) or `protocol-ping`. A protocol-ping client (the CLI) is dropped after `MISSED_PONGS_LIMIT` (default 2) checks in a row with no answer. The radio gateway (`role: "gateway"`) is judged on time instead: it is dropped after `GATEWAY_GRACE_MS` (default 45 000) without an answer, because it usually sits behind another internet connection that stalls now and then. `silent_s` is the time since its last message of any kind (a quiet gateway has long silences that mean nothing); `since_pong_s` is the time since its last answer to a ping. |
 | `event-loop-lag` | warn | lag_ms, clients, suppressed | The server's own check ran late, so this process was stalled (a busy or stalled disk on the host). Nobody is judged on that round. At most one per minute. |
 | `priority-denied` | warn | id, name, reason | A client offered a priority token that did not count. `reason` is `wrong-token`, or `priority-disabled-on-server` when the server has no valid `PRIORITY_TOKEN`. The token itself is never logged. |
 | `priority-disabled` | error | reason, fix | `PRIORITY_TOKEN` is a placeholder or too short, so priority is off. |

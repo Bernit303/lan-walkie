@@ -221,6 +221,9 @@ h2 { font-size: 12px; margin: 0; font-weight: 650; color: var(--muted); }
 .talk-screen { overflow: hidden; }
 .status-panel { min-height: 0; padding: 8px 14px; border-radius: 12px; }
 #status { margin: 0; height: auto; max-height: 40px; }
+/* Inside the status panel, so the screen layouts below do not move. Shown only when the radio gateway is unstable or offline. */
+.radio-banner { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); color: var(--accent); font-size: 13px; line-height: 18px; font-weight: 700; overflow-wrap: anywhere; }
+.radio-banner.offline { border-top: 2px solid var(--accent); }
 .transmit-panel { padding-top: clamp(8px, 2dvh, 20px); }
 .talk-help { margin-top: 10px; }
 .beep-slot { min-height: 0; padding: 2px 0; }

@@ -232,3 +232,45 @@ test('device kind comes from the role and the user agent', () => {
   assert.equal(deviceKind('browser', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0'), 'desktop');
   assert.equal(deviceKind('browser', undefined), 'desktop');
 });
+
+test('lastGatewaySeen: null with no gateway, then the latest moment one was there', { skip }, () => {
+  const { store } = setup();
+  assert.equal(store.lastGatewaySeen(), null);
+
+  // A phone does not count.
+  store.sessionStart({ connId: 'phone01', ip: '10.0.0.9', ua: 'Mozilla/5.0 (Linux; Android 14) Mobile', ts: T0 });
+  store.sessionJoin({ connId: 'phone01', deviceId: 'browser-device01', name: 'Mom', role: 'browser', ua: 'Mozilla/5.0 (Linux; Android 14) Mobile', ts: T0 + 5 });
+  assert.equal(store.lastGatewaySeen(), null);
+
+  // A gateway that has joined and is still connected: the moment it joined.
+  store.sessionStart({ connId: 'radio01', ip: '10.0.0.5', ua: 'Python/3.12', ts: T0 + 10 });
+  store.sessionJoin({ connId: 'radio01', deviceId: 'cli-gateway0001', name: 'Radio', role: 'gateway', ua: 'Python/3.12', ts: T0 + 20 });
+  assert.equal(store.lastGatewaySeen(), T0 + 20);
+
+  // Once it has left, the moment it left.
+  store.sessionEnd({ connId: 'radio01', reason: 'dead-connection', code: 1006, ts: T0 + 5000 });
+  assert.equal(store.lastGatewaySeen(), T0 + 5000);
+
+  // A later gateway session wins.
+  store.sessionStart({ connId: 'radio02', ip: '10.0.0.5', ua: 'Python/3.12', ts: T0 + 6000 });
+  store.sessionJoin({ connId: 'radio02', deviceId: 'cli-gateway0001', name: 'Radio', role: 'gateway', ua: 'Python/3.12', ts: T0 + 6010 });
+  assert.equal(store.lastGatewaySeen(), T0 + 6010);
+  store.close();
+});
+
+test('lastGatewaySeen: a gateway session left open by a crash counts as seen when the server stopped', { skip }, () => {
+  const first = setup();
+  first.store.sessionStart({ connId: 'radio01', ip: '10.0.0.5', ua: 'Python/3.12', ts: T0 });
+  first.store.sessionJoin({ connId: 'radio01', deviceId: 'cli-gateway0001', name: 'Radio', role: 'gateway', ua: 'Python/3.12', ts: T0 + 10 });
+  first.store.event('stats', null, {}, T0 + 90000); // the last sign of life
+  first.store.close();
+
+  const second = createStore({ dir: first.dir, log: { error() {}, info() {}, warn() {}, debug() {} } });
+  assert.equal(second.lastGatewaySeen(), T0 + 90000);
+  second.close();
+});
+
+test('lastGatewaySeen: a disabled store knows nothing', () => {
+  const off = createStore({ enabled: false });
+  assert.equal(off.lastGatewaySeen(), null);
+});

@@ -27,6 +27,10 @@ services:
       - CERT_IPS=${CERT_IPS:-}
       - MAX_TRANSMIT_MS=${MAX_TRANSMIT_MS:-60000}
       - MAX_CLIENTS=${MAX_CLIENTS:-32}
+      # How long (ms) the radio gateway may stay silent before it is dropped as dead.
+      # Other clients get about 10 s; the gateway usually sits behind another internet
+      # connection, so it gets longer. Browsers are told when it is unstable or gone.
+      - GATEWAY_GRACE_MS=${GATEWAY_GRACE_MS:-45000}
       # Roger beep for every client (browsers, CLI, radio gateway): on/off.
       - ROGER_BEEP=${ROGER_BEEP:-off}
       # Logging (see docs/LOGGING.md): LOG_LEVEL debug|info|warn|error,

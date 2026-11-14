@@ -278,6 +278,27 @@ let floorName = null; // name of whoever holds the floor
 let missedCaller = null; // someone talked while the page was hidden
 let noticeShown = false;
 
+// How the radio gateway is doing, as the server reports it (`radio` message):
+// 'none' (no radio on this channel, or not heard of yet), 'online', 'unstable'
+// or 'offline'. Shown as a banner under the status line, so nobody keeps
+// talking into a radio that cannot hear them.
+const radioBannerEl = document.getElementById('radio-banner');
+let radioState = 'none';
+
+function radioBannerText(state) {
+  if (state === 'offline') return 'Radio offline. Nobody on the radio can hear you.';
+  if (state === 'unstable') return 'Radio link unstable. The radio may miss what you say.';
+  return '';
+}
+
+function setRadioState(state) {
+  radioState = state === 'online' || state === 'unstable' || state === 'offline' ? state : 'none';
+  const text = radioBannerText(radioState);
+  radioBannerEl.textContent = text;
+  radioBannerEl.classList.toggle('hidden', !text);
+  radioBannerEl.classList.toggle('offline', radioState === 'offline');
+}
+
 function updateCallNotice() {
   const talking = floorHolder && floorHolder !== myId ? String(floorName || 'Someone') : null;
   if (!document.hidden) missedCaller = null;
@@ -508,6 +529,11 @@ function connect() {
       return;
     }
 
+    if (msg.type === 'radio') {
+      setRadioState(msg.state);
+      return;
+    }
+
     if (msg.type === 'floor-denied') {
       noteActivity();
       setPttLabel(`${msg.name} IS TALKING`);
@@ -589,6 +615,9 @@ function resetForReconnect() {
   floorHolder = null;
   floorName = null;
   updateCallNotice();
+  // Our own connection is down, so what we knew about the radio is stale; the
+  // server says again after we rejoin.
+  setRadioState('none');
   wantTalk = false;
   if (audioTrack) audioTrack.enabled = false;
   pttBtn.classList.remove('active');

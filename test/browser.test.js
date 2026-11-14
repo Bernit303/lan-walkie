@@ -108,10 +108,23 @@ async function loadPage({ wakeLock, storage = {}, userAgent = 'Mozilla/5.0 (X11;
 
   // The document: visibility is controllable, everything else is a harmless stub.
   const doc = { hidden: false, listeners: {} };
+  // The one element whose text and classes the tests read back.
+  const radioBanner = {
+    textContent: '',
+    classes: new Set(['hidden']),
+    classList: {
+      add: (c) => radioBanner.classes.add(c),
+      remove: (c) => radioBanner.classes.delete(c),
+      toggle: (c, force) => ((force === undefined ? !radioBanner.classes.has(c) : force) ? radioBanner.classes.add(c) : radioBanner.classes.delete(c)),
+      contains: (c) => radioBanner.classes.has(c),
+    },
+    get visible() { return !radioBanner.classes.has('hidden'); },
+  };
   const documentStub = new Proxy({}, {
     get: (_t, key) => {
       if (key === 'hidden') return doc.hidden;
       if (key === 'title') return doc.title;
+      if (key === 'getElementById') return (id) => (id === 'radio-banner' ? radioBanner : anyStub());
       if (key === 'addEventListener') return (type, fn) => { (doc.listeners[type] = doc.listeners[type] || []).push(fn); };
       return anyStub();
     },
@@ -170,7 +183,7 @@ async function loadPage({ wakeLock, storage = {}, userAgent = 'Mozilla/5.0 (X11;
     for (const fn of sock.handlers.open || []) fn();
     await settle();
   };
-  return { run, sock, sockets, connections, advance, setHidden, open, storage, doc };
+  return { run, sock, sockets, connections, advance, setHidden, open, storage, doc, radioBanner };
 }
 
 test('one failed connection is retried on its own; healthy connections and the session stay up', async () => {
@@ -433,4 +446,53 @@ test('presence is sent after joining and on every visibility change', async () =
   await desktop.sock.deliver({ type: 'welcome', id: 'mmm' });
   desktop.setHidden(true);
   assert.deepEqual(desktop.sock.sent.filter((m) => m.type === 'presence')[1], { type: 'presence', visible: false, audible: true });
+});
+
+test('radio banner: hidden until the server says the radio is offline or unstable', async () => {
+  const page = await loadPage();
+  await page.sock.deliver({ type: 'welcome', id: 'mmm' });
+  assert.equal(page.radioBanner.visible, false, 'no radio news, no banner');
+
+  await page.sock.deliver({ type: 'radio', state: 'offline' });
+  assert.equal(page.radioBanner.visible, true);
+  assert.equal(page.radioBanner.textContent, 'Radio offline. Nobody on the radio can hear you.');
+  assert.equal(page.radioBanner.classes.has('offline'), true);
+
+  await page.sock.deliver({ type: 'radio', state: 'unstable' });
+  assert.equal(page.radioBanner.visible, true);
+  assert.equal(page.radioBanner.textContent, 'Radio link unstable. The radio may miss what you say.');
+  assert.equal(page.radioBanner.classes.has('offline'), false, 'unstable is not shown as offline');
+
+  await page.sock.deliver({ type: 'radio', state: 'online' });
+  assert.equal(page.radioBanner.visible, false, 'a radio that is back clears the banner');
+  assert.equal(page.radioBanner.textContent, '');
+});
+
+test('radio banner: an unknown or missing state is treated as no news, never as a warning', async () => {
+  const page = await loadPage();
+  await page.sock.deliver({ type: 'welcome', id: 'mmm' });
+  await page.sock.deliver({ type: 'radio', state: 'offline' });
+  for (const state of ['banana', undefined, null, 42, '']) {
+    await page.sock.deliver({ type: 'radio', state: 'offline' });
+    await page.sock.deliver({ type: 'radio', state });
+    assert.equal(page.radioBanner.visible, false, `state ${String(state)} must clear the banner`);
+  }
+});
+
+test('radio banner: cleared while this phone is itself reconnecting', async () => {
+  const page = await loadPage();
+  await page.sock.deliver({ type: 'welcome', id: 'mmm' });
+  await page.sock.deliver({ type: 'radio', state: 'offline' });
+  assert.equal(page.radioBanner.visible, true);
+  for (const fn of page.sock.handlers.close || []) fn(); // our own connection dropped
+  assert.equal(page.radioBanner.visible, false, 'what we knew about the radio is stale once we are offline ourselves');
+  assert.equal(page.run('radioState'), 'none');
+});
+
+test('radio banner: a hostile state value cannot put text in the banner', async () => {
+  const page = await loadPage();
+  await page.sock.deliver({ type: 'welcome', id: 'mmm' });
+  await page.sock.deliver({ type: 'radio', state: '<img src=x onerror=alert(1)>' });
+  assert.equal(page.radioBanner.textContent, '');
+  assert.equal(page.radioBanner.visible, false);
 });
